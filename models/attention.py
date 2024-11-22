@@ -7,8 +7,9 @@ from torch import nn
 from einops import rearrange
 import math
 from models.positional_encoding import RotaryPositionalEmbeddings, AlibiPositionalBias, T5RelativePositionBias
-from models.attention_utils import repeat_kv, apply_rotary_emb, compute_causal_mask
+from models.attention_utils import repeat_kv, compute_causal_mask
 from torch.nn.attention.flex_attention import flex_attention
+import textwrap
 
 
 # these position encoding models have an interface of the form (qseqlen: int, kseqlen: int) -> Tensor[n_heads, qseqlen, kseqlen]
@@ -36,7 +37,7 @@ def get_pos_enc_support(pos_enc_model):
         )
     if pos_enc_model is None:
         support_dict['flash'] = True
-        support_dict['flex'] = True
+        support_dict['flex'] = False
     return support_dict
 
 class Attention(nn.Module):
@@ -89,6 +90,11 @@ class Attention(nn.Module):
         self.pos_enc_model = pos_enc_model
         self.pos_enc_model_type = get_pos_enc_model_type(pos_enc_model)
         self.pos_enc_support = get_pos_enc_support(pos_enc_model)
+        if self.pos_enc_support['flex']:
+            print(textwrap.fill("NOTE: this positional encoding method supports flex attention, "
+                  "but you need to build the block mask using build_attn_block_mask(), "
+                  "unless you are not using any attention mask or causal mask. "
+                  "If you don't build the block mask, attention will be computed manually."))
 
         self.key_dim = key_dim if key_dim is not None else self.d_model // self.n_heads # key dimension
         self.n_rep_kv = self.n_heads // self.n_kv_heads # use same kv heads for several query heads
@@ -108,7 +114,6 @@ class Attention(nn.Module):
         self.attn_dropout = nn.Dropout(self.dropout)
         self.resid_dropout = nn.Dropout(self.dropout)
 
-
         self.block_mask = None
 
 
@@ -124,7 +129,8 @@ class Attention(nn.Module):
 
     def build_attn_block_mask(self, mask_mod, qseqlen, kseqlen, device):
         print("WARNING: after building block_mask, is_causal and need_weights will be ignored in forward and self.block_mask will be used instead (if flex attention is being used)")
-        self.block_mask = torch.nn.attention.flex_attention.create_block_mask(mask_mod, B=None, H=None, Q_LEN=qseqlen, KV_LEN=kseqlen, device=device)
+        self.block_mask = torch.nn.attention.flex_attention.create_block_mask(
+            mask_mod, B=None, H=None, Q_LEN=qseqlen, KV_LEN=kseqlen, device=device)
 
 
     def forward(
@@ -133,7 +139,7 @@ class Attention(nn.Module):
         key: torch.Tensor,
         value: torch.Tensor,
         mask_func: callable = None,
-        is_causal: bool = False, # indicates causal mask; should only set one of is_causal and attn_mask
+        is_causal: bool = False, # indicates causal mask; should only set one of is_causal and mask_func
         need_weights: bool = False
     ):
         """
@@ -151,11 +157,10 @@ class Attention(nn.Module):
             key sequence of shape [bsz, len_ctx, d_model]
         value : torch.Tensor
             value sequence of shape [bsz, len_ctx, d_model]
-        attn_mask : torch.Tensor, optional
-            boolean attention mask of shape [len_in, len_ctx]. True at [i,j] indicates i is allowed to attend to j.
-            By default None
+        mask_func : callable, optional
+            mask_mod function. This is a callable that defines the masking pattern for the attention mechanism. It takes four arguments: b (batch size), h (number of heads), q_idx (query index), and kv_idx (key/value index). It should return a boolean tensor indicating which attention connections are allowed (True) or masked out (False).
         is_causal : bool, optional
-            whether to apply a causal mask. If True, attn_mask must be None. Only applies for self-attention.
+            whether to apply a causal mask. If True, mask_func must be None. Only applies for self-attention.
             By default False
         need_weights : bool, optional
             whether to return the attention scores. If True, return value will be tuple (output, attn_scores).
@@ -179,7 +184,8 @@ class Attention(nn.Module):
             assert qseqlen == kseqlen, "query and key sequences must have the same length for causal mask"
             attn_mask = compute_causal_mask(qseqlen, device=query.device)
         elif not is_causal and mask_func is not None:
-            attn_mask = torch.nn.attention.flex_attention.create_mask(mask_func, B=None, H=None, Q_LEN=qseqlen, KV_LEN=kseqlen, device=query.device)
+            attn_mask = torch.nn.attention.flex_attention.create_mask(
+                mask_func, B=None, H=None, Q_LEN=qseqlen, KV_LEN=kseqlen, device=query.device)
         else:
             attn_mask = None
 
