@@ -8,8 +8,6 @@ from einops import rearrange
 import math
 from models.positional_encoding import RotaryPositionalEmbeddings, AlibiPositionalBias, T5RelativePositionBias
 from models.attention_utils import repeat_kv, compute_causal_mask
-from torch.nn.attention.flex_attention import flex_attention
-import textwrap
 
 
 # these position encoding models have an interface of the form (qseqlen: int, kseqlen: int) -> Tensor[n_heads, qseqlen, kseqlen]
@@ -25,19 +23,15 @@ def get_pos_enc_model_type(pos_enc_model):
         raise ValueError(f"unknown positional encoding model: {pos_enc_model}")
 
 def get_pos_enc_support(pos_enc_model):
-    flash_support = [RotaryPositionalEmbeddings]
-    flex_support = [AlibiPositionalBias]
-    # NOTE: positional encoding methods that support flash_attention also support flex_attention, but flash_attention is faster
-    # so we only use flex_attention when flash_attention is not available
+    flash_support = [RotaryPositionalEmbeddings, AlibiPositionalBias]
+    # NOTE: T5RelativePositionBias does not support flash attention because flash attention requires a fixed bias (cannot backprop)
 
     support_dict = dict(
-        flash=any(isinstance(pos_enc_model, model) for model in flash_support), # positional encoding methods that support flash_attention
-        flex=any(isinstance(pos_enc_model, model) for model in flex_support), # positional encoding methods that support flex_attention
+        flash=any(isinstance(pos_enc_model, model) for model in flash_support), # positional encoding methods that support flash attention
         manual=True # all support manual
         )
     if pos_enc_model is None:
         support_dict['flash'] = True
-        support_dict['flex'] = False
     return support_dict
 
 class Attention(nn.Module):
@@ -90,11 +84,6 @@ class Attention(nn.Module):
         self.pos_enc_model = pos_enc_model
         self.pos_enc_model_type = get_pos_enc_model_type(pos_enc_model)
         self.pos_enc_support = get_pos_enc_support(pos_enc_model)
-        if self.pos_enc_support['flex']:
-            print(textwrap.fill("NOTE: this positional encoding method supports flex attention, "
-                  "but you need to build the block mask using build_attn_block_mask(), "
-                  "unless you are not using any attention mask or causal mask. "
-                  "If you don't build the block mask, attention will be computed manually."))
 
         self.key_dim = key_dim if key_dim is not None else self.d_model // self.n_heads # key dimension
         self.n_rep_kv = self.n_heads // self.n_kv_heads # use same kv heads for several query heads
@@ -126,12 +115,6 @@ class Attention(nn.Module):
             score_mod = None
 
         return score_mod
-
-    def build_attn_block_mask(self, mask_mod, qseqlen, kseqlen, device):
-        print("WARNING: after building block_mask, is_causal and need_weights will be ignored in forward and self.block_mask will be used instead (if flex attention is being used)")
-        self.block_mask = torch.nn.attention.flex_attention.create_block_mask(
-            mask_mod, B=None, H=None, Q_LEN=qseqlen, KV_LEN=kseqlen, device=device)
-
 
     def forward(
         self,
@@ -184,6 +167,7 @@ class Attention(nn.Module):
             assert qseqlen == kseqlen, "query and key sequences must have the same length for causal mask"
             attn_mask = compute_causal_mask(qseqlen, device=query.device)
         elif not is_causal and mask_func is not None:
+            # TODO: avoid flex_attention dependency now that I've removed it
             attn_mask = torch.nn.attention.flex_attention.create_mask(
                 mask_func, B=None, H=None, Q_LEN=qseqlen, KV_LEN=kseqlen, device=query.device)
         else:
@@ -211,34 +195,30 @@ class Attention(nn.Module):
         xk = xk.transpose(1, 2)  # (bs, n_heads, seqlen, key_dim)
         xv = xv.transpose(1, 2)  # (bs, n_heads, seqlen, head_dim)
 
-        # determine whether to use flash attention or flex attention or manual attention
-        # use flash attention if no need for weights and no positional encoding or rotary positional encoding
-        use_flash_attn = (not need_weights) and self.pos_enc_support['flash']
-        # use flex attention if no need for weights and positional encoding is bias-type and ((block_mask is computed) or no need for block_mask)
-        use_flex_attn = (not need_weights) and self.pos_enc_support['flex'] and (self.block_mask is not None or (mask_func is None and not is_causal))
+        # determine whether to use flash attention or manual attention
+        # use flash attention if no need for weights and positional encoding method supports it
+        use_flash_attn = (not need_weights) and self.pos_enc_support['flash'] and (not mask_func)
 
         # can use F.scaled_dot_product_attention's implementation of flash attention
         if use_flash_attn:
-            output = torch.nn.functional.scaled_dot_product_attention(
-                xq, xk, xv, attn_mask=attn_mask, dropout_p=self.dropout if self.training else 0.0, is_causal=is_causal, scale=self.attn_scale)
-            scores = None
 
-        # use flex attention (e.g., supports score modification like relative positional bias)
-        elif use_flex_attn:
-            # compute bias to be added to attention score
+            # fixed bias-based positional encoding method (e.g., AlibiPositionalBias)
             if self.pos_enc_model_type in ['score_bias']:
                 scores_bias = self.pos_enc_model(qseqlen, kseqlen)
-            else:
-                scores_bias = None
-            # create `score_mod` for flex_attention
-            score_mod = self.create_attn_score_mod(bias=scores_bias)
+                if attn_mask is not None:
+                    mask_bias = torch.zeros(qseqlen, kseqlen, dtype=xq.dtype, device=xq.device).masked_fill(attn_mask.logical_not(), float('-inf'))
+                    scores_bias = scores_bias + mask_bias
 
-            # NOTE: flex_attention does not support dropout on attention scores (unlike flash attention or manual implementation below)
-            output = flex_attention(
-                xq, xk, xv, score_mod=score_mod, block_mask=self.block_mask, scale=self.attn_scale)
+                output = torch.nn.functional.scaled_dot_product_attention(
+                    xq, xk, xv, attn_mask=scores_bias, dropout_p=self.dropout if self.training else 0.0, scale=self.attn_scale)
+
+            # no bias-based positional encoding (e.g., RoPE or NoPE)
+            else:
+                output = torch.nn.functional.scaled_dot_product_attention(
+                    xq, xk, xv, attn_mask=attn_mask, dropout_p=self.dropout if self.training else 0.0, is_causal=is_causal, scale=self.attn_scale)
             scores = None
 
-        # manual implementation (which exposes attention scores)
+        # manual implementation (which explicitly computes attention scores)
         else:
             # compute dot product attention scores (pre-softmax)
             scores = torch.matmul(xq, xk.transpose(2, 3)) * self.attn_scale
