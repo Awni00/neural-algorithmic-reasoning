@@ -9,31 +9,6 @@ import math
 from models.positional_encoding import RotaryPositionalEmbeddings, AlibiPositionalBias, T5RelativePositionBias
 from models.attention_utils import repeat_kv, compute_causal_mask
 
-
-# these position encoding models have an interface of the form (qseqlen: int, kseqlen: int) -> Tensor[n_heads, qseqlen, kseqlen]
-def get_pos_enc_model_type(pos_enc_model):
-    # this groups positional encoding models into categories based on their interface
-    if any(isinstance(pos_enc_model, model) for model in [AlibiPositionalBias, T5RelativePositionBias]):
-        return 'score_bias'
-    elif isinstance(pos_enc_model, RotaryPositionalEmbeddings):
-        return 'rotary'
-    elif pos_enc_model is None:
-        return None
-    else:
-        raise ValueError(f"unknown positional encoding model: {pos_enc_model}")
-
-def get_pos_enc_support(pos_enc_model):
-    flash_support = [RotaryPositionalEmbeddings, AlibiPositionalBias]
-    # NOTE: T5RelativePositionBias does not support flash attention because flash attention requires a fixed bias (cannot backprop)
-
-    support_dict = dict(
-        flash=any(isinstance(pos_enc_model, model) for model in flash_support), # positional encoding methods that support flash attention
-        manual=True # all support manual
-        )
-    if pos_enc_model is None:
-        support_dict['flash'] = True
-    return support_dict
-
 class Attention(nn.Module):
     def __init__(self,
             d_model: int,
@@ -246,3 +221,27 @@ class Attention(nn.Module):
         output = self.resid_dropout(output)
 
         return output, scores
+
+# these position encoding models have an interface of the form (qseqlen: int, kseqlen: int) -> Tensor[n_heads, qseqlen, kseqlen]
+def get_pos_enc_model_type(pos_enc_model):
+    # this groups positional encoding models into categories based on their interface
+    if any(isinstance(pos_enc_model, model) for model in [AlibiPositionalBias, T5RelativePositionBias]):
+        return 'score_bias'
+    elif isinstance(pos_enc_model, RotaryPositionalEmbeddings):
+        return 'rotary'
+    elif pos_enc_model is None:
+        return None
+    else:
+        raise ValueError(f"unknown positional encoding model: {pos_enc_model}")
+
+def get_pos_enc_support(pos_enc_model):
+    flash_support = [RotaryPositionalEmbeddings, AlibiPositionalBias]
+    # NOTE: T5RelativePositionBias does not support flash attention because flash attention requires a fixed bias (cannot backprop)
+
+    support_dict = dict(
+        flash=any(isinstance(pos_enc_model, model) for model in flash_support), # positional encoding methods that support flash attention
+        manual=True # all support manual
+        )
+    if pos_enc_model is None:
+        support_dict['flash'] = True
+    return support_dict
