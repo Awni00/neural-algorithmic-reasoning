@@ -36,20 +36,16 @@ class TestAttention(unittest.TestCase):
         key = torch.randn(self.batch_size, self.seq_len, self.d_model)
         value = torch.randn(self.batch_size, self.seq_len, self.d_model)
 
-        attn = attn.to(torch.device('cuda:0' if torch.cuda.is_available() else 'cpu'))
-        query, key, value = (x.to(torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')) for x in [query, key, value])
-
         for is_causal in [True, False]:
             output1, scores1 = attn(query, key, value, is_causal=is_causal, need_weights=True)
             output2, scores2 = attn(query, key, value, is_causal=is_causal, need_weights=False)
 
             self.assertTrue(
-                torch.allclose(output1, output2, atol=1e-4),
+                torch.allclose(output1, output2, atol=1e-7), # Alibi actually fails at atol 1e-8
                 f"Outputs differ for is_causal={is_causal} between need_weights=True and need_weights=False"
                 f"\noutput1={output1}\noutput2={output2}")
             self.assertIsNotNone(scores1, "Scores should be returned when need_weights=True")
 
-            attn.block_mask = None # clear block mask for next iteration
 
 if __name__ == "__main__":
     unittest.main()
