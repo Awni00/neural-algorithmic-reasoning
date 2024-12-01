@@ -6,8 +6,8 @@ import torch
 from torch import nn
 from einops import rearrange
 import math
-from models.positional_encoding import RotaryPositionalEmbeddings, AlibiPositionalBias, T5RelativePositionBias
-from models.attention_utils import repeat_kv, compute_causal_mask
+from .positional_encoding import RotaryPositionalEmbeddings, AlibiPositionalBias, T5RelativePositionBias
+from .attention_utils import repeat_kv, compute_causal_mask
 
 class Attention(nn.Module):
     def __init__(self,
