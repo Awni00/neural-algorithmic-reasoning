@@ -7,7 +7,7 @@ from torch import nn
 from einops import rearrange
 import math
 from .positional_encoding import RotaryPositionalEmbeddings, AlibiPositionalBias, T5RelativePositionBias
-from .attention_utils import repeat_kv, compute_causal_mask
+from .attention_utils import repeat_kv, compute_causal_mask, get_attention_function
 
 class Attention(nn.Module):
     def __init__(self,
@@ -20,6 +20,8 @@ class Attention(nn.Module):
             add_bias_kv: bool = False,
             add_bias_out: bool = False,
             symmetric_attn: bool = False,
+            attn_score_fn: str = 'softmax',
+            attn_score_fn_params: dict = None,
             ):
         """
         An implementation of Attention with some added customization.
@@ -45,6 +47,8 @@ class Attention(nn.Module):
             whether to use bias in out projection, by default False
         symmetric_attn : bool, optional
             whether to weight-tie the query and key projections, making a symmetric attention criterion. By default False
+        attn_score_fn : str, optional
+            activation function for attention scores. One of 'softmax', 'hard', 'topk-softmax', 'sigmoid', or 'linear' (default is 'softmax').
         """
 
         super().__init__()
@@ -58,7 +62,6 @@ class Attention(nn.Module):
 
         self.pos_enc_model = pos_enc_model
         self.pos_enc_model_type = get_pos_enc_model_type(pos_enc_model)
-        self.pos_enc_support = get_pos_enc_support(pos_enc_model)
 
         self.key_dim = key_dim if key_dim is not None else self.d_model // self.n_heads # key dimension
         self.n_rep_kv = self.n_heads // self.n_kv_heads # use same kv heads for several query heads
@@ -78,8 +81,18 @@ class Attention(nn.Module):
         self.attn_dropout = nn.Dropout(self.dropout)
         self.resid_dropout = nn.Dropout(self.dropout)
 
-        self.block_mask = None
+        # activation function for attention scores (e.g., softmax, hard, topk-softmax, sigmoid, linear)
+        self.attn_score_fn = attn_score_fn
+        self.attn_score_fn_params = attn_score_fn_params or {}
+        self.attn_score_fn_ = get_attention_function(self.attn_score_fn, self.attn_score_fn_params)
 
+        # check whether configuration (namely positional encoding model and attention score function) supports flash attention
+        self.support_flash = self.is_flash_supported()
+
+    def is_flash_supported(self):
+        pos_enc_support = get_pos_enc_support(self.pos_enc_model)
+        attn_func_support = self.attn_score_fn == 'softmax'
+        return pos_enc_support['flash'] and attn_func_support
 
     def create_attn_score_mod(self, bias=None):
         if bias is not None:
@@ -172,7 +185,7 @@ class Attention(nn.Module):
 
         # determine whether to use flash attention or manual attention
         # use flash attention if no need for weights and positional encoding method supports it
-        use_flash_attn = (not need_weights) and self.pos_enc_support['flash'] and (not mask_func)
+        use_flash_attn = (not need_weights) and self.support_flash and (not mask_func)
 
         # can use F.scaled_dot_product_attention's implementation of flash attention
         if use_flash_attn:
@@ -187,7 +200,7 @@ class Attention(nn.Module):
                 output = torch.nn.functional.scaled_dot_product_attention(
                     xq, xk, xv, attn_mask=scores_bias, dropout_p=self.dropout if self.training else 0.0, scale=self.attn_scale)
 
-            # no bias-based positional encoding (e.g., RoPE or NoPE)
+            # pos enc already applied to xq and/or xk (e.g., RoPE or NoPE)
             else:
                 output = torch.nn.functional.scaled_dot_product_attention(
                     xq, xk, xv, attn_mask=attn_mask, dropout_p=self.dropout if self.training else 0.0, is_causal=is_causal, scale=self.attn_scale)
@@ -203,12 +216,15 @@ class Attention(nn.Module):
                 scores_bias = self.pos_enc_model(qseqlen, kseqlen)
                 scores = scores + scores_bias
 
-            if attn_mask is not None:
+            if attn_mask is not None and self.attn_score_fn in ['softmax', 'topk-softmax', 'hard']:
                 attn_mask_ = torch.zeros(qseqlen, kseqlen, dtype=xq.dtype, device=xq.device).masked_fill(attn_mask.logical_not(), float('-inf'))
                 scores = scores + attn_mask_
 
-            # apply softmax activation to inner products
-            scores = torch.nn.functional.softmax(scores, dim=-1)
+            # apply softmax (or other) activation to inner products
+            scores = self.attn_score_fn_(scores)
+
+            if attn_mask is not None and self.attn_score_fn not in ['softmax', 'topk-softmax', 'hard']:
+                scores = scores.masked_fill(attn_mask.logical_not(), 0)
 
             scores = self.attn_dropout(scores)
             output = torch.matmul(scores, xv)  # (bs, n_local_heads, seqlen, head_dim)
