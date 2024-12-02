@@ -21,6 +21,7 @@ class TransformerModel(torch.nn.Module):
         self.vocab_size = model_config.vocab_size
         self.pos_enc_type = model_config.pos_enc_type
         self.pos_enc_kwargs = getattr(model_config, 'pos_enc_kwargs', {})
+        self.attn_kwargs = getattr(model_config, 'attn_kwargs', {})
 
         self.input_recall = getattr(model_config, 'input_recall', False)
 
@@ -28,7 +29,8 @@ class TransformerModel(torch.nn.Module):
 
         self.embedder = torch.nn.Embedding(model_config.vocab_size, model_config.d_model)
         self.encoder = torch.nn.ModuleList([EncoderBlock(
-            d_model=self.d_model, n_heads=self.n_heads, dff=self.dff, pos_enc_model=self.pos_enc_model) for _ in range(model_config.n_layers)])
+            d_model=self.d_model, n_heads=self.n_heads, dff=self.dff, pos_enc_model=self.pos_enc_model, attn_kwargs=self.attn_kwargs)
+            for _ in range(model_config.n_layers)])
         self.linear = torch.nn.Linear(model_config.d_model, model_config.vocab_size)
 
         # weight tying
@@ -206,7 +208,12 @@ def get_experiment_name(model_config, data_config, train_config):
     # Name: Seed + Date-Time
     data_str = f'MaxVal{data_config.max_value}-TrainLen{data_config.train_sequence_length}'
     model_str = f'L{model_config.n_layers}H{model_config.n_heads}D{model_config.d_model}_{model_config.pos_enc_type}_IR{model_config.input_recall}'
+    if model_config.attn_kwargs.attn_score_fn != 'softmax':
+        model_str += f'_{model_config.attn_kwargs.attn_score_fn}'
     group_name = f'{data_str} - {model_str}'
-    run_name = 'seed-' + str(train_config.seed) + ' - ' + datetime.now().strftime("%Y-%m-%d-%H:%M:%S")
+
+    run_name = datetime.now().strftime("%Y-%m-%d-%H:%M:%S")
+    if getattr(train_config, 'seed', None) is not None:
+        run_name = 'seed-' + str(train_config.seed) + ' - ' + run_name
 
     return group_name, run_name
