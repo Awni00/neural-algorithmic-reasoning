@@ -1,5 +1,6 @@
 import torch
 from typing import Any, Optional, Tuple
+from functools import partial
 
 
 def repeat_kv(x: torch.Tensor, n_rep: int) -> torch.Tensor:
@@ -69,3 +70,78 @@ def compute_causal_mask(size, device=None):
     """computes an attention mask with True at (i,j) if i <= j"""
     causal_mask = torch.tril(torch.ones(size, size, device=device)).bool()
     return causal_mask
+
+
+# region alternative attention activations (e.g., softmax, topk-softmax, one-hot straight-through)
+
+def topk_softmax(logits: torch.Tensor, k: int, straight_through: bool = False) -> torch.Tensor:
+    """
+    Apply top-k softmax to the logits.
+
+    Parameters
+    ----------
+    logits : torch.Tensor
+        [batch_size, n_heads, seq_len, seq_len] tensor of logits.
+    k : int
+        The number of top elements to consider.
+    straight_through : bool, optional
+        Whether to use the straight-through estimator (default is False).
+
+    Returns
+    -------
+    torch.Tensor
+        topk-softmax attention scores.
+    """
+
+    orig_logits = logits
+
+    mask_value = -torch.finfo(logits.dtype).max
+    top_values, _ = logits.topk(k, dim = -1)
+    sparse_topk_mask = (logits >= top_values[..., -1:]) & (logits > mask_value)
+    logits = logits.masked_fill(~sparse_topk_mask, mask_value)
+    topk_attn = logits.softmax(dim = -1)
+
+    if straight_through:
+        # straight-through estimator: value returned is topk_attn, but gradient is soft_attn
+
+        soft_attn = orig_logits.softmax(dim = -1)
+        return topk_attn.detach() + soft_attn - soft_attn.detach()
+    else:
+        return topk_attn
+
+def get_attention_function(activation: str, kwargs: dict) -> Any:
+    """
+    Get the attention function based on the activation.
+
+    Parameters
+    ----------
+    activation : str
+        The activation function.
+    kwargs : dict
+        The keyword arguments for the activation function (if applicable).
+
+    Returns
+    -------
+    Any
+        The attention function.
+    """
+
+    if activation == "softmax":
+        return partial(torch.nn.functional.softmax, dim=-1)
+    elif activation == "topk-softmax":
+        return partial(topk_softmax, **kwargs)
+    elif activation == "hard":
+        return partial(topk_softmax, k=1, **kwargs)
+    elif activation == "sigmoid":
+        return torch.nn.functional.sigmoid
+    elif activation == "relu":
+        return torch.nn.functional.relu
+    elif activation == "linear":
+        return lambda x: x
+    else:
+        raise ValueError(f"Activation function {activation} not valid.")
+# endregion
+
+# TODO: implement different similarity functions 
+# TODO: e.g., Selective Attention, which masks *future* tokens: https://arxiv.org/pdf/2410.02703
+# TODO: allow for more finegrained control over backend to use in torch.nn.functional.scaled_dot_product_attention: https://pytorch.org/docs/stable/generated/torch.nn.attention.sdpa_kernel.html
