@@ -1,5 +1,6 @@
 import argparse
 import yaml
+import ast
 import numpy as np
 import torch
 from torch.utils.data import DataLoader
@@ -19,7 +20,7 @@ parser = argparse.ArgumentParser()
 parser.add_argument('--config_dir', type=str, default='data/dag_data.pt')
 parser.add_argument('--debug', action='store_true', help='Run in debug mode (no logging, no checkpoints).')
 
-args = parser.parse_args()
+args, unknown_args = parser.parse_known_args()
 
 # load model, train, and data config
 with open(os.path.join(args.config_dir, 'model_config.yaml')) as f:
@@ -31,12 +32,25 @@ with open(os.path.join(args.config_dir, 'train_config.yaml')) as f:
 with open(os.path.join(args.config_dir, 'data_config.yaml')) as f:
     data_config = AttributeDict(yaml.load(f, Loader=yaml.FullLoader))
 
+# update configs with command line arguments (if applicable)
+if len(unknown_args) > 0:
+    print('='*80)
+    print("Received unknown arguments:", unknown_args)
+for arg_str in unknown_args:
+    for (prefix, config) in [('--train_config.', train_config), ('--data_config.', data_config), ('--model_config.', model_config)]:
+        if arg_str.startswith(prefix):
+            key, value = arg_str[len(prefix):].split('=')
+            config[key] = ast.literal_eval(value)
+            print(f"Updated {prefix}{key} to {value}")
+
 # print configs
 print('='*80)
 print("Model Config:")
 print(model_config)
+print('-'*80)
 print("Train Config:")
 print(train_config)
+print('-'*80)
 print("Data Config:")
 print(data_config)
 print('='*80)
@@ -62,14 +76,14 @@ pl.seed_everything(seed) # sets the seed for all random number generators
 train_config.seed = seed
 
 
-train_ds = SortingDataset(max_value=data_config.max_value, sequence_length=data_config.train_sequence_length, batch_size=train_config.batch_size, num_samples=data_config.num_train_samples, device=device)
+train_ds = SortingDataset(max_value=data_config.max_value, sequence_length=data_config.train_sequence_length, batch_size=train_config.batch_size, num_samples=data_config.num_train_samples)
 train_dataloader = DataLoader(train_ds, batch_size=None, shuffle=True, num_workers=train_config.num_workers, pin_memory=True)
 
-val_ds = SortingDataset(max_value=data_config.max_value, sequence_length=data_config.train_sequence_length, batch_size=train_config.batch_size, num_samples=data_config.num_val_samples, device=device)
+val_ds = SortingDataset(max_value=data_config.max_value, sequence_length=data_config.train_sequence_length, batch_size=train_config.batch_size, num_samples=data_config.num_val_samples)
 val_dataloader = DataLoader(val_ds, batch_size=None, shuffle=False, num_workers=train_config.num_workers, pin_memory=True)
 
 ood_test_dss = [
-    SortingDataset(max_value=data_config.max_value, sequence_length=ood_seq_len, batch_size=train_config.batch_size, num_samples=data_config.num_val_samples, device=device)
+    SortingDataset(max_value=data_config.max_value, sequence_length=ood_seq_len, batch_size=train_config.batch_size, num_samples=data_config.num_test_samples)
     for ood_seq_len in data_config.ood_test_sequence_lengths]
 ood_test_dataloaders = [
     DataLoader(ood_test_ds, batch_size=None, shuffle=False, num_workers=train_config.num_workers, pin_memory=True)
@@ -117,12 +131,6 @@ if args.debug:
 if getattr(train_config, 'matmul_precision', None) is not None:
     torch.set_float32_matmul_precision(train_config.matmul_precision)
     print(f'Matmul precision set to {train_config.matmul_precision}.')
-
-# compile the model
-if getattr(train_config, 'compile', False):
-    # litmodel = torch.compile(litmodel)
-    litmodel.model = torch.compile(litmodel.model)
-    print('Model compiled.')
 
 trainer_kwargs = dict(
     max_epochs=train_config.max_epochs,
