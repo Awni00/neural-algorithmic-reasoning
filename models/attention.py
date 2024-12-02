@@ -247,6 +247,8 @@ def get_pos_enc_model_type(pos_enc_model):
         return 'rotary'
     elif pos_enc_model is None:
         return None
+    elif pos_enc_model in ['sinusoidal', 'learned']:
+        return None
     else:
         raise ValueError(f"unknown positional encoding model: {pos_enc_model}")
 
