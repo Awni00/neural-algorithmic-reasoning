@@ -210,6 +210,8 @@ def get_experiment_name(model_config, data_config, train_config):
     model_str = f'L{model_config.n_layers}H{model_config.n_heads}D{model_config.d_model}_{model_config.pos_enc_type}_IR{model_config.input_recall}'
     if model_config.attn_kwargs.attn_score_fn != 'softmax':
         model_str += f'_{model_config.attn_kwargs.attn_score_fn}'
+        if model_config.attn_kwargs.get('attn_score_fn_params', {}).get('straight_through', False):
+            model_str += '-ST'
     group_name = f'{data_str} - {model_str}'
 
     run_name = datetime.now().strftime("%Y-%m-%d-%H:%M:%S")
