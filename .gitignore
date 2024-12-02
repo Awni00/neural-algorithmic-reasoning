@@ -6,7 +6,13 @@ __pycache__/
 # C extensions
 *.so
 
+# logs
 wandb/
+lightning_logs/
+
+# slurm stuff
+jobs/**/*.job
+jobs/**/*.out
 
 # Distribution / packaging
 .Python
