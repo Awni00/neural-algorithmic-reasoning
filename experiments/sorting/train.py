@@ -40,7 +40,14 @@ for arg_str in unknown_args:
     for (prefix, config) in [('--train_config.', train_config), ('--data_config.', data_config), ('--model_config.', model_config)]:
         if arg_str.startswith(prefix):
             key, value = arg_str[len(prefix):].split('=')
-            config[key] = ast.literal_eval(value)
+            value = ast.literal_eval(value)
+            key_parts = key.split('.')
+            # traverse through the config dict to the second last key
+            for k in key_parts[:-1]:
+                if k not in config:
+                    config[k] = {}
+                config = config[k]
+            config[key_parts[-1]] = value
             print(f"Updated {prefix}{key} to {value}")
 
 # print configs
