@@ -12,8 +12,8 @@ import einx
 from einops.layers.torch import Rearrange
 from einops import rearrange, repeat, reduce, pack, unpack
 
-sys.path.append(os.path.dirname(os.path.abspath(__file__)))
-from .utils import exists, default, l2norm, pad_at_dim, Sequential
+import os, sys; sys.path.insert(0, os.path.abspath('..')) # add project root dir to path
+from utils.utils import exists, default, l2norm, pad_at_dim, Sequential
 
 # region
 # code in this region is based on https://github.com/lucidrains/x-transformers/blob/144d9ba84955139347e798ab025457b2d7adc314/x_transformers/x_transformers.py (November 8, 2024)
