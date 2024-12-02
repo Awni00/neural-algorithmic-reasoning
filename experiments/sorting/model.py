@@ -32,7 +32,8 @@ class TransformerModel(torch.nn.Module):
         self.linear = torch.nn.Linear(model_config.d_model, model_config.vocab_size)
 
         # weight tying
-        self.linear.weight = self.embedder.weight
+        if getattr(model_config, 'weight_tying', False):
+            self.linear.weight = self.embedder.weight
 
     def get_pos_enc_model(self):
         if self.pos_enc_type == 'sinusoidal':
@@ -67,6 +68,10 @@ class LitModel(pl.LightningModule):
         self.model_config = model_config
         self.data_config = data_config
         self.train_config = train_config
+
+        if train_config.compile:
+            self.model = torch.compile(self.model)
+            print('Model compiled.')
 
         self.criterion = torch.nn.CrossEntropyLoss()
 
@@ -104,7 +109,7 @@ class LitModel(pl.LightningModule):
 
         ood_length = self.data_config.ood_test_sequence_lengths[dataloader_idx]
 
-        self.log_metrics(metrics, key_dir='test', prefix=f'L={ood_length}')
+        self.log_metrics(metrics, key_dir='test', prefix=f'L={ood_length}', add_dataloader_idx=False)
 
         return metrics['loss']
 
@@ -114,8 +119,8 @@ class LitModel(pl.LightningModule):
 
         # compute accuracy
         _, predicted = torch.max(logits, -1)
-        per_token_acc = (predicted == y).float().mean().item()
-        sequence_acc = (predicted == y).all(dim=1).float().mean().item()
+        per_token_acc = (predicted == y).float().mean()#.item()
+        sequence_acc = (predicted == y).all(dim=1).float().mean()#.item()
 
         metrics = dict(loss=loss, per_token_acc=per_token_acc, sequence_acc=sequence_acc)
         return metrics
@@ -128,7 +133,7 @@ class LitModel(pl.LightningModule):
             if prefix is not None:
                 key_prefix += f'{prefix}_'
 
-            key = f'{key_prefix}_{key}'
+            key = f'{key_prefix}{key}'
             self.log(key, value, **log_kwargs)
 
     def configure_optimizers(self):
@@ -200,7 +205,7 @@ def get_experiment_name(model_config, data_config, train_config):
     # Group: Data Config - Model Config
     # Name: Seed + Date-Time
     data_str = f'MaxVal{data_config.max_value}-TrainLen{data_config.train_sequence_length}'
-    model_str = f'L{model_config.n_layers}H{model_config.n_heads}D{model_config.d_model}_{model_config.pos_enc_type}'
+    model_str = f'L{model_config.n_layers}H{model_config.n_heads}D{model_config.d_model}_{model_config.pos_enc_type}_IR{model_config.input_recall}'
     group_name = f'{data_str} - {model_str}'
     run_name = 'seed-' + str(train_config.seed) + ' - ' + datetime.now().strftime("%Y-%m-%d-%H:%M:%S")
 
