@@ -6,6 +6,7 @@ from datetime import datetime
 
 from models.transformer_blocks import EncoderBlock
 from models.positional_encoding import ScaledSinusoidalEmbedding, AbsolutePositionalEmbedding, AlibiPositionalBias, T5RelativePositionBias, RotaryPositionalEmbeddings
+from models.misc import ConcatCombine
 
 
 class TransformerModel(torch.nn.Module):
@@ -24,6 +25,11 @@ class TransformerModel(torch.nn.Module):
         self.attn_kwargs = getattr(model_config, 'attn_kwargs', {})
 
         self.input_recall = getattr(model_config, 'input_recall', False)
+        self.input_recall_type = getattr(model_config, 'input_recall_type', 'add')
+        if self.input_recall_type == 'add':
+            self.input_recall_combine = lambda x, y: x + y
+        elif self.input_recall_type == 'concat':
+            self.input_recall_combine = ConcatCombine(dim=self.d_model)
 
         self.pos_enc_model = self.get_pos_enc_model()
 
@@ -57,9 +63,8 @@ class TransformerModel(torch.nn.Module):
         for encoder in self.encoder:
             x = encoder(x)
             if self.input_recall:
-                x = x + input_emb
-                # NOTE: could add linear map before residual connection to input to place input in residual stream
-                # could also concatenate rather than add
+                x = self.input_recall_combine(x, input_emb)
+
         x = self.linear(x)
         return x
 
