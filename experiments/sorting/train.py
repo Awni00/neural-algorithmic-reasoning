@@ -8,11 +8,10 @@ from torch.utils.data import DataLoader
 import pytorch_lightning as pl
 from pytorch_lightning import Trainer
 from pytorch_lightning.callbacks import ModelCheckpoint, LearningRateMonitor
-# from lightning.pytorch.utilities.parsing import AttributeDict
 
 import os, sys; sys.path.insert(0, os.path.abspath('../..')) # add project root dir to path
 from model import LitModel, get_experiment_name
-from models.utils import AttributeDict
+from utils.utils import AttributeDict, print_gpu_info
 from tasks.sorting import SortingDataset
 
 
@@ -63,15 +62,7 @@ print(data_config)
 print('='*80)
 
 # GPU diagnostics
-if torch.cuda.is_available():
-    num_gpus = torch.cuda.device_count()
-    print(f"Number of GPUs available: {num_gpus}")
-    for i in range(num_gpus):
-        print(f"GPU {i}: {torch.cuda.get_device_name(i)}")
-        print(f"Memory Allocated: {torch.cuda.memory_allocated(i) / 1024**3:.2f} GB")
-        print(f"Memory Cached: {torch.cuda.memory_reserved(i) / 1024**3:.2f} GB")
-else:
-    print("No GPU available, using CPU")
+print_gpu_info()
 
 # current device
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -157,38 +148,3 @@ trainer.fit(litmodel, train_dataloader, val_dataloader)
 # # test the model on OOD data
 ood_test_result = trainer.test(dataloaders=ood_test_dataloaders)
 print(ood_test_result)
-
-# # training loop
-# criterion = torch.nn.CrossEntropyLoss()
-# optimizer = torch.optim.Adam(model.parameters(), lr=0.001)
-
-# num_steps = len(train_dataloader)
-# log_interval = 100
-
-# total_loss = 0
-# correct_tokens = 0
-# total_tokens = 0
-# correct_sequences = 0
-# total_sequences = 0
-
-# for step, (x, y) in enumerate(train_dataloader):
-#     x, y = x.to(device), y.to(device)
-#     optimizer.zero_grad()
-#     y_pred = model(x)
-#     loss = criterion(y_pred.view(-1, max_value), y.view(-1))
-#     loss.backward()
-#     optimizer.step()
-
-#     total_loss += loss.item()
-#     _, predicted = torch.max(y_pred, -1)
-#     correct_tokens += (predicted == y).sum().item()
-#     total_tokens += y.numel()
-#     correct_sequences += (predicted == y).all(dim=1).sum().item()
-#     total_sequences += y.size(0)
-
-#     if (step + 1) % log_interval == 0:
-#         avg_loss = total_loss / (step + 1)
-#         token_accuracy = correct_tokens / total_tokens * 100
-#         sequence_accuracy = correct_sequences / total_sequences * 100
-#         print(f'Step [{step + 1}/{num_steps}], Loss: {avg_loss:.4f}, Token Accuracy: {token_accuracy:.2f}%, Sequence Accuracy: {sequence_accuracy:.2f}%')
-
