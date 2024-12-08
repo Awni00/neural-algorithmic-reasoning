@@ -109,17 +109,16 @@ logger = pl.loggers.WandbLogger(
 
 
 # callbacks: checkpoint and lr monitor
-# checkpoint_dir = f'checkpoints/{train_config.experiment_group}-{train_config.experiment_run_name}'
-# checkpoint_callback = ModelCheckpoint(
-#     dirpath=checkpoint_dir,
-#     filename='{epoch}-{val_loss:.4f}',
-#     monitor='total_loss/val', # this depends on logging in the LightningModule
-#     mode='min',
-# )
+checkpoint_dir = f'checkpoints/{train_config.experiment_group}-{train_config.experiment_run_name}'
+checkpoint_callback = ModelCheckpoint(
+    dirpath=checkpoint_dir,
+    filename='{epoch}-{val_loss:.4f}',
+    monitor='val/loss', # this depends on logging in the LightningModule
+    mode='min',
+)
 
 lr_monitor = LearningRateMonitor(logging_interval='step')
-# callbacks = [lr_monitor, checkpoint_callback] # no checkpointing for now
-callbacks = [lr_monitor]
+callbacks = [lr_monitor, checkpoint_callback]
 
 if args.debug:
     callbacks = []
