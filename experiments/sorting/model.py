@@ -2,6 +2,8 @@ import torch
 import pytorch_lightning as pl
 import lightning
 
+import pandas as pd
+
 from datetime import datetime
 
 from models.transformer_blocks import EncoderBlock
@@ -83,8 +85,8 @@ class LitModel(pl.LightningModule):
         self.criterion = torch.nn.CrossEntropyLoss()
 
 
-    def forward(self, factored_tokens):
-        return self.model(factored_tokens)
+    def forward(self, x):
+        return self.model(x)
 
     def training_step(self, batch):
 
@@ -111,14 +113,34 @@ class LitModel(pl.LightningModule):
     def test_step(self, batch, batch_idx=0, dataloader_idx=0):
 
         x, y = batch
-        logits = self.model(x)
+        n_iters = self.train_config.test_max_n_iters
+
+        logits = self.model(x, n_iters=n_iters)
         metrics = self.compute_metrics(batch, logits)
 
         ood_length = self.data_config.ood_test_sequence_lengths[dataloader_idx]
 
-        self.log_metrics(metrics, key_dir='test', prefix=f'L={ood_length}', add_dataloader_idx=False)
+        self.test_step_outputs.append(dict(ood_length=ood_length, metrics=metrics))
+
+        # self.log_metrics(metrics, key_dir='test', prefix=f'L={ood_length}', add_dataloader_idx=False)
 
         return metrics['loss']
+
+    def on_test_epoch_end(self):
+
+        metrics_list = []
+        for L in self.data_config.ood_test_sequence_lengths:
+            metrics = [output['metrics'] for output in self.test_step_outputs if output['ood_length'] == L]
+            metrics = {key: torch.tensor([m[key].item() for m in metrics]).mean() for key in metrics[0].keys()}
+
+            metrics_list.append(metrics)
+
+        # plot line plots of metrics (metric vs L)
+        test_df = pd.DataFrame(metrics_list)
+        test_df['L'] = self.data_config.ood_test_sequence_lengths
+        self.logger.log_table('test/ood_eval', dataframe=test_df)
+
+        self.test_step_outputs.clear()  # free memory
 
     def compute_metrics(self, batch, logits):
         x, y = batch
