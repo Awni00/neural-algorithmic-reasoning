@@ -35,6 +35,8 @@ class Attention(nn.Module):
             model dimension
         n_heads : int
             number of heads (query heads if n_kv_heads is set)
+        pos_enc_model : nn.Module, optional
+            positional encoding model, e.g., RoPE, T5RelativePositionalBias, etc. (default is None)
         dropout : float
             dropout rate
         n_kv_heads : int, optional
@@ -49,6 +51,8 @@ class Attention(nn.Module):
             whether to weight-tie the query and key projections, making a symmetric attention criterion. By default False
         attn_score_fn : str, optional
             activation function for attention scores. One of 'softmax', 'hard', 'topk-softmax', 'sigmoid', or 'linear' (default is 'softmax').
+        attn_score_fn_params : dict, optional
+            additional parameters for the attention score function, e.g., whether to use straight-through estimator for sparse softmax variants, etc. (default is None)
         """
 
         super().__init__()
