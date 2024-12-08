@@ -27,10 +27,12 @@ def generate_batch(max_value, sequence_length, batch_size):
     return x, y
 
 class SortingDataset(Dataset):
-    def __init__(self, max_value, sequence_length, batch_size, num_samples, device=None):
+    def __init__(self, max_value, sequence_length, batch_size, num_samples, random_sequence_length=False, min_sequence_length=None, device=None):
 
         self.max_value = max_value
         self.sequence_length = sequence_length
+        self.random_sequence_length = random_sequence_length
+        self.min_sequence_length = min_sequence_length if min_sequence_length is not None else 2
         self.num_samples = num_samples
         self.batch_size = batch_size
         self.device = device
@@ -39,7 +41,13 @@ class SortingDataset(Dataset):
         return self.num_samples
 
     def __getitem__(self, idx):
-        x, y = generate_batch(max_value=self.max_value, sequence_length=self.sequence_length, batch_size=self.batch_size)
+
+        if self.random_sequence_length:
+            L = np.random.randint(self.min_sequence_length, self.sequence_length + 1)
+        else:
+            L = self.sequence_length
+
+        x, y = generate_batch(max_value=self.max_value, sequence_length=L, batch_size=self.batch_size)
         if self.device is not None:
             x, y = x.to(self.device), y.to(self.device)
         return x, y
