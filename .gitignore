@@ -10,6 +10,12 @@ __pycache__/
 wandb/
 lightning_logs/
 
+# experiment config files
+experiments/**/experiment_configs/**
+
+# checkpoint files
+experiments/**/checkpoints/**
+
 # slurm stuff
 jobs/**/*.job
 jobs/**/*.out
