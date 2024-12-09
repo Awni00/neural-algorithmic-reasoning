@@ -6,7 +6,7 @@ import torch
 from torch import nn
 from einops import rearrange
 import math
-from .positional_encoding import RotaryPositionalEmbeddings, AlibiPositionalBias, T5RelativePositionBias
+from .positional_encoding import RotaryPositionalEmbeddings, AlibiPositionalBias, T5RelativePositionBias, ScaledSinusoidalEmbedding, AbsolutePositionalEmbedding
 from .attention_utils import repeat_kv, compute_causal_mask, get_attention_function
 
 class Attention(nn.Module):
@@ -251,7 +251,7 @@ def get_pos_enc_model_type(pos_enc_model):
         return 'rotary'
     elif pos_enc_model is None:
         return None
-    elif pos_enc_model in ['sinusoidal', 'learned']:
+    elif any(isinstance(pos_enc_model, model) for model in [ScaledSinusoidalEmbedding, AbsolutePositionalEmbedding]):
         return None
     else:
         raise ValueError(f"unknown positional encoding model: {pos_enc_model}")
