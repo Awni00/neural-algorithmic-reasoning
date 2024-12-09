@@ -31,9 +31,9 @@ class RecurrentTransformerModel(torch.nn.Module):
         self.pos_enc_kwargs = getattr(model_config, 'pos_enc_kwargs', {})
         self.attn_kwargs = getattr(model_config, 'attn_kwargs', {})
 
-        self.discrete_intermediate = getattr(model_config, 'discrete_intermediate', False)
-        self.discretization_map_type = getattr(model_config, 'discretize_map', None)
-        self.discretization_map_params = getattr(model_config, 'discretization_map_params', {})
+        self.discrete_intermediate = getattr(getattr(model_config, 'intermediate_discretization', {}), 'discrete_intermediate', False)
+        self.discretization_map_type = getattr(getattr(model_config, 'intermediate_discretization', {}), 'discretize_map', None)
+        self.discretization_map_params = getattr(getattr(model_config, 'intermediate_discretization', {}), 'discretization_map_params', {})
         if self.discretization_map_type is not None:
             self.discretization_map = get_discretization_amp(self.discretization_map_type, self.discretization_map_params)
         assert self.discretization_map is not None or not self.discrete_intermediate, "Discretization map must be provided for discrete intermediate."
@@ -333,8 +333,6 @@ class LitRecurrentModel(pl.LightningModule):
 
         # heatmap of n_iters vs L vs sequence_acc
         heatmap = test_df.pivot(index='n_iters', columns='L')['sequence_acc']
-        print('sequence_acc heatmap')
-        print(heatmap)
         fig = px.imshow(heatmap, x=heatmap.columns, y=heatmap.index, title='Sequence Accuracy', zmin=0, zmax=1, origin='lower', color_continuous_scale='Hot')
         fig.add_hline(y=self.train_config.train_max_n_iters, line_dash='dash', line_color='black', annotation_text='train_max_n_iters', annotation_position='bottom left')
         fig.add_vline(x=self.data_config.train_sequence_length, line_dash='dash', line_color='black', annotation_text='train_max_seq_len', annotation_position='bottom right')
@@ -342,35 +340,10 @@ class LitRecurrentModel(pl.LightningModule):
 
         # heatmap of n_iters vs L vs per_token_acc
         heatmap = test_df.pivot(index='n_iters', columns='L')['per_token_acc']
-        print('per_token_acc heatmap')
-        print(heatmap)
         fig = px.imshow(heatmap, x=heatmap.columns, y=heatmap.index, title='Token-wise Accuracy', zmin=0, zmax=1, origin='lower', color_continuous_scale='Hot')
         fig.add_hline(y=self.train_config.train_max_n_iters, line_dash='dash', line_color='black', annotation_text='train_max_n_iters', annotation_position='bottom left')
         fig.add_vline(x=self.data_config.train_sequence_length, line_dash='dash', line_color='black', annotation_text='train_max_seq_len', annotation_position='bottom right')
         wandb.log({'test/ood_eval/per_token_acc_heatmap': wandb.Plotly(fig)})
-
-def get_experiment_name(model_config, data_config, train_config):
-    # Format:
-    # Group: Data Config - Model Config
-    # Name: Seed + Date-Time
-    data_str = f'MaxVal{data_config.max_value}-TrainLen{data_config.train_sequence_length}'
-    model_str = f'L{model_config.n_layers}H{model_config.n_heads}D{model_config.d_model}_{model_config.pos_enc_type}_IR{model_config.input_recall}'
-    if model_config.attn_kwargs.attn_score_fn != 'softmax':
-        model_str += f'_{model_config.attn_kwargs.attn_score_fn}'
-        if model_config.attn_kwargs.get('attn_score_fn_params', {}).get('straight_through', False):
-            model_str += '-ST'
-
-    if model_config.discrete_intermediate:
-        model_str += f'_disc-{model_config.discretize_map}'
-
-    group_name = f'{data_str} - {model_str}'
-
-    run_name = datetime.now().strftime("%Y-%m-%d-%H:%M:%S")
-    if getattr(train_config, 'seed', None) is not None:
-        run_name = 'seed-' + str(train_config.seed) + ' - ' + run_name
-
-    return group_name, run_name
-
 
 def get_discretization_amp(discretization_map_type: str, kwargs: dict):
 
@@ -390,3 +363,36 @@ def get_discretization_amp(discretization_map_type: str, kwargs: dict):
         return lambda x: x
     else:
         raise ValueError(f"Discretization map type {discretization_map_type} not valid.")
+
+def get_experiment_name(model_config, data_config, train_config):
+    # Format:
+    # Group: Model Config - Train Config - Data Config
+    # Name: Seed + Date-Time
+    data_str = f'MaxVal{data_config.max_value}-TrainLen{data_config.train_sequence_length}'
+    if data_config.get('train_random_sequence_length', False):
+        data_str += f'RandLen'
+    model_str = f'L{model_config.n_layers}H{model_config.n_heads}D{model_config.d_model}_{model_config.pos_enc_type}_IR{model_config.input_recall}'
+
+    # attn_score_fn
+    if model_config.attn_kwargs.attn_score_fn != 'softmax':
+        model_str += f'_{model_config.attn_kwargs.attn_score_fn}'
+        if model_config.attn_kwargs.get('attn_score_fn_params', {}).get('straight_through', False):
+            model_str += '-ST'
+
+    if model_config.intermediate_discretization.discrete_intermediate:
+        model_str += f'_discinterm-{model_config.intermediate_discretization.discretize_map}'
+
+    # train config (progressive training and/or incremental training)
+    train_str = ''
+    if train_config.progressive_training:
+        train_str += 'progressive'
+    if train_config.incremental_training:
+        train_str += '_incremental'
+
+    group_name = f'{model_str} - {train_str} - {data_str}'
+
+    run_name = datetime.now().strftime("%Y-%m-%d-%H:%M:%S")
+    if getattr(train_config, 'seed', None) is not None:
+        run_name = 'seed-' + str(train_config.seed) + ' - ' + run_name
+
+    return group_name, run_name
