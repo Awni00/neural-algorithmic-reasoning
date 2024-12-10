@@ -26,6 +26,7 @@ class RecurrentTransformerModel(torch.nn.Module):
         self.d_head = model_config.d_model // model_config.n_heads
         self.n_layers = model_config.n_layers
         self.dff = model_config.dff
+        self.mlp_activation = getattr(model_config, 'mlp_activation', 'relu')
         self.vocab_size = model_config.vocab_size
         self.pos_enc_type = model_config.pos_enc_type
         self.pos_enc_kwargs = getattr(model_config, 'pos_enc_kwargs', {})
@@ -45,11 +46,12 @@ class RecurrentTransformerModel(torch.nn.Module):
         elif self.input_recall_type == 'concat':
             self.input_recall_combine = ConcatCombine(dim=self.d_model)
 
+        # TODO: decide whether to share positional encodings across layers
         self.pos_enc_model = self.get_pos_enc_model()
 
         self.embedder = torch.nn.Embedding(model_config.vocab_size, model_config.d_model)
         self.encoder = torch.nn.ModuleList([EncoderBlock(
-            d_model=self.d_model, n_heads=self.n_heads, dff=self.dff, pos_enc_model=self.pos_enc_model, attn_kwargs=self.attn_kwargs)
+            d_model=self.d_model, n_heads=self.n_heads, dff=self.dff, activation=self.mlp_activation, pos_enc_model=self.pos_enc_model, attn_kwargs=self.attn_kwargs)
             for _ in range(model_config.n_layers)])
         self.to_token_logits = torch.nn.Linear(model_config.d_model, model_config.vocab_size)
 
@@ -83,6 +85,9 @@ class RecurrentTransformerModel(torch.nn.Module):
         if not skip_embed:
             input_emb = self.embedder(x)
             x = input_emb
+
+            if any(isinstance(self.pos_enc_model, model) for model in [ScaledSinusoidalEmbedding, AbsolutePositionalEmbedding]):
+                x += self.pos_enc_model(x)
 
         for i in range(n_iters):
             if self.input_recall:
@@ -381,6 +386,8 @@ def get_experiment_name(model_config, data_config, train_config):
 
     if model_config.intermediate_discretization.discrete_intermediate:
         model_str += f'_discinterm-{model_config.intermediate_discretization.discretize_map}'
+    else:
+        model_str += '_discinterm-NA'
 
     # train config (progressive training and/or incremental training)
     train_str = ''
