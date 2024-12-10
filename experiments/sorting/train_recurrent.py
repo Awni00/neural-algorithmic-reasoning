@@ -123,7 +123,7 @@ model_summary_dict = AttributeDict({
 
 
 # logger
-# Group: Data Config - Model Config ... Run name: Seed + Date-Time
+# Group: Data Config - Model Config / Run name: Seed + Date-Time
 group_name, run_name = get_experiment_name(model_config, data_config, train_config)
 
 train_config.experiment_run_name = run_name
@@ -149,7 +149,8 @@ checkpoint_callback = ModelCheckpoint(
 )
 
 lr_monitor = LearningRateMonitor(logging_interval='step')
-callbacks = [lr_monitor, checkpoint_callback]
+progbar = pl.callbacks.TQDMProgressBar(refresh_rate=250)
+callbacks = [lr_monitor, checkpoint_callback, progbar]
 
 if args.debug:
     callbacks = []
@@ -177,4 +178,3 @@ trainer.fit(litmodel, train_dataloader, val_dataloader)
 
 # # test the model on OOD data
 ood_test_result = trainer.test(dataloaders=ood_test_dataloaders, ckpt_path='best')
-print(ood_test_result)
