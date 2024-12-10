@@ -289,8 +289,23 @@ def get_activation_function(name):
         'relu': nn.ReLU(),
         'sigmoid': nn.Sigmoid(),
         'tanh': nn.Tanh(),
+
+        # Gaussian Error Linear Unit: GELU(x) = x * GaussianCDF(x)
         'gelu': nn.GELU(approximate='tanh'),
+
+        # Sigmoid Linear Unit: silu(x) = x * sigmoid(x)
         'silu': nn.SiLU(),
+
+        # Softmax of Linear Units: SoLU(x) = x * softmax(x)
+        # (https://transformer-circuits.pub/2022/solu/index.html)
+        'solu': lambda x: x * torch.nn.functional.softmax(x, dim=-1),
+
+        # LayerNormed Softmax of Linear Units: LNSoLU(x) = LN(x * softmax(x))
+        # Note: here, I am using layernorm functional with no learnable parameters;
+        # Note: interpretable activations would be pre-norm post-softmax (i.e., the SoLU part)
+        # NOTE: this is equivalent to the original SoLU(x) = LN(x * exp(x)) in terms of final model performance due to scale-invariance of LayerNorm
+        'lnsolu': lambda x: torch.nn.functional.layer_norm(x * torch.nn.functional.softmax(x, dim=-1)),
+
         'softmax': nn.Softmax(dim=-1),
         'identity': nn.Identity(),
         # add more if needed
