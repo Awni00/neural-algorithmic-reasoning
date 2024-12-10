@@ -46,7 +46,7 @@ class RecurrentTransformerModel(torch.nn.Module):
         elif self.input_recall_type == 'concat':
             self.input_recall_combine = ConcatCombine(dim=self.d_model)
 
-        # TODO: decide whether to share positional encodings across layers
+        # FIXME: decide whether to share positional encodings across layers
         self.pos_enc_model = self.get_pos_enc_model()
 
         self.embedder = torch.nn.Embedding(model_config.vocab_size, model_config.d_model)
@@ -376,7 +376,7 @@ def get_experiment_name(model_config, data_config, train_config):
     data_str = f'MaxVal{data_config.max_value}-TrainLen{data_config.train_sequence_length}'
     if data_config.get('train_random_sequence_length', False):
         data_str += f'RandLen'
-    model_str = f'L{model_config.n_layers}H{model_config.n_heads}D{model_config.d_model}_{model_config.pos_enc_type}_IR{model_config.input_recall}'
+    model_str = f'L{model_config.n_layers}H{model_config.n_heads}D{model_config.d_model}_{model_config.pos_enc_type}_IR{model_config.input_recall}_WT{model_config.weight_tying}'
 
     # attn_score_fn
     if model_config.attn_kwargs.attn_score_fn != 'softmax':
