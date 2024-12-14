@@ -16,6 +16,8 @@ from models.positional_encoding import ScaledSinusoidalEmbedding, AbsolutePositi
 from models.misc import ConcatCombine
 from models.attention_utils import topk_softmax
 
+# model_config: temparature annealing (TODO)
+# model_config: intermediate_compute_vocab (TODO) [additional vocab for intermediate states] [how to interact with weight-tying??]
 class RecurrentTransformerModel(torch.nn.Module):
     def __init__(self, model_config):
         super(RecurrentTransformerModel, self).__init__()
@@ -35,10 +37,16 @@ class RecurrentTransformerModel(torch.nn.Module):
         self.discrete_intermediate = getattr(getattr(model_config, 'intermediate_discretization', {}), 'discrete_intermediate', False)
         self.discretization_map_type = getattr(getattr(model_config, 'intermediate_discretization', {}), 'discretize_map', None)
         self.discretization_map_params = getattr(getattr(model_config, 'intermediate_discretization', {}), 'discretization_map_params', {})
-        if self.discretization_map_type is not None:
-            self.discretization_map = get_discretization_amp(self.discretization_map_type, self.discretization_map_params)
+        if self.discretization_map_type is not None and self.discrete_intermediate:
+            # discretization map for intermediate states (e.g., softmax, hardmax, gumbel-softmax, etc.)
+            self.discretization_map = get_discretization_map(self.discretization_map_type, self.discretization_map_params)
+
+            # used for mapping discrete intermediate state to embedded state (optionally tied with embedding matrix)
+            self.token_to_embed = torch.nn.Linear(model_config.vocab_size, model_config.d_model)
+
         assert self.discretization_map is not None or not self.discrete_intermediate, "Discretization map must be provided for discrete intermediate."
 
+        # input recall (incorporates original input into hidden state at each recurrent iteration)
         self.input_recall = getattr(model_config, 'input_recall', False)
         self.input_recall_type = getattr(model_config, 'input_recall_type', 'add')
         if self.input_recall_type == 'add':
@@ -46,28 +54,44 @@ class RecurrentTransformerModel(torch.nn.Module):
         elif self.input_recall_type == 'concat':
             self.input_recall_combine = ConcatCombine(dim=self.d_model)
 
-        # FIXME: decide whether to share positional encodings across layers
-        self.pos_enc_model = self.get_pos_enc_model()
+        # if using sinusoidal or learned positional encodings, create the positional encoding model
+        self.pos_enc_model = self.get_pos_enc_model() if self.pos_enc_type in ['sinusoidal', 'learned'] else None
 
         self.embedder = torch.nn.Embedding(model_config.vocab_size, model_config.d_model)
-        self.encoder = torch.nn.ModuleList([EncoderBlock(
-            d_model=self.d_model, n_heads=self.n_heads, dff=self.dff, activation=self.mlp_activation, pos_enc_model=self.pos_enc_model, attn_kwargs=self.attn_kwargs)
-            for _ in range(model_config.n_layers)])
-        self.to_token_logits = torch.nn.Linear(model_config.d_model, model_config.vocab_size)
 
-        self.token_to_embed = torch.nn.Linear(model_config.vocab_size, model_config.d_model)
+        # each recurrent step involves running a sequence of Transformer blocks (incl. attention + MLP)
+        self.encoder = torch.nn.ModuleList([EncoderBlock(
+            d_model=self.d_model, n_heads=self.n_heads, dff=self.dff, activation=self.mlp_activation, 
+            pos_enc_model=self.get_pos_enc_model(attn=True), # positional encoding model for attention (e.g., RoPE, T5, etc.)
+            attn_kwargs=self.attn_kwargs)
+            for _ in range(model_config.n_layers)])
+        self.embed_to_token_logits = torch.nn.Linear(model_config.d_model, model_config.vocab_size)
+
+        # pre-discretization layernorm
+        # note: if logits have large magnitude, gradient of softmax will be small, making training difficult
+        # layernorm can help with this
+        self.pre_disc_ln = torch.nn.LayerNorm(model_config.d_model) if model_config.predisc_norm else torch.nn.Identity()
+        self.post_dic_ln = torch.nn.LayerNorm(model_config.d_model) if model_config.postdisc_norm else torch.nn.Identity()
 
         # weight tying
-        if getattr(model_config, 'weight_tying', False):
-            self.to_token_logits.weight = self.embedder.weight
+        self.weight_tie_embed_to_token = getattr(model_config, 'weight_tie_embed_to_token', False)
+        self.weight_tie_discrete_interm = getattr(model_config, 'weight_tie_discrete_interm', False)
 
-            if self.discrete_intermediate:
-                self.token_to_embed.weight = torch.nn.Parameter(self.embedder.weight.t())
+        # weight tying between embedder and embed_to_token_logits (mapping embeddings to discrete tokens, for now both in final prediction and intermediate discrete states, if applicable)
+        if self.weight_tie_embed_to_token:
+            self.embed_to_token_logits.weight = self.embedder.weight
 
-    def get_pos_enc_model(self):
-        if self.pos_enc_type == 'sinusoidal':
+        # weight tying between token_to_embed (mapping discrete tokens to embeddings) and the models embedding layer
+        if self.discrete_intermediate and self.weight_tie_discrete_interm:
+            self.token_to_embed.weight = torch.nn.Parameter(self.embedder.weight.t())
+            # NOTE: for now, we always use embed_to_token_logits to map embedding to discrete intermediate state tokens, regardless of weight tying configuration (i.e., will be weight-tied if weight_tie_embed_to_token is True)
+            # self.token_to_embed maps the discrete intermediate state tokens back to the embedding space; whether this is weight-tied with the embedding matrix is determined by weight_tie_discrete_interm
+            # TODO: think about this more carefully... e.g., do we want more fine-grained control over weight tying?
+
+    def get_pos_enc_model(self, attn=True):
+        if self.pos_enc_type == 'sinusoidal' and not attn:
             return ScaledSinusoidalEmbedding(dim=self.d_model, **self.pos_enc_kwargs)
-        elif self.pos_enc_type == 'learned':
+        elif self.pos_enc_type == 'learned' and not attn:
             return AbsolutePositionalEmbedding(dim=self.d_model, **self.pos_enc_kwargs)
         elif self.pos_enc_type == 'alibi':
             return AlibiPositionalBias(heads=self.n_heads, **self.pos_enc_kwargs) # can specify slopes in pos_enc_kwargs
@@ -78,9 +102,9 @@ class RecurrentTransformerModel(torch.nn.Module):
         else:
             return None
 
-    def forward(self, x, n_iters=1, skip_embed=False, input_emb=None, skip_output=False):
+    def forward(self, x, n_iters=1, skip_embed=False, orig_input=None, skip_output=False, return_intermediate_states=False):
 
-        assert not (skip_embed and input_emb is None), "If skip_embed is True, input_emb must be provided."
+        assert not (skip_embed and orig_input is None), "If skip_embed is True, input_emb must be provided."
 
         if not skip_embed:
             input_emb = self.embedder(x)
@@ -88,23 +112,36 @@ class RecurrentTransformerModel(torch.nn.Module):
 
             if any(isinstance(self.pos_enc_model, model) for model in [ScaledSinusoidalEmbedding, AbsolutePositionalEmbedding]):
                 x += self.pos_enc_model(x)
+        else:
+            input_emb = self.embedder(orig_input)
 
-        for i in range(n_iters):
+        intermediate_states = dict(disc_interm_states=[], logits_states=[])
+
+        for iter in range(n_iters):
             if self.input_recall:
                 x = self.input_recall_combine(x, input_emb)
 
             x = self.compute_iteration(x)
 
             if self.discrete_intermediate:
-                x = self.to_token_logits(x)
+                x = self.pre_disc_ln(x) # normalize before discretization
+
+                x = self.embed_to_token_logits(x)
+                intermediate_states['logits_states'].append(x)
+
                 x = self.discretization_map(x)
+                intermediate_states['disc_interm_states'].append(x)
 
                 x = self.token_to_embed(x)
-                # x = torch.matmul(x, self.embedder.weight)
-                # NOTE : here, I am "weight-tying" the output of the discretization map to the embedding matrix
-                # TODO: make this a separate learnable map? or make weight-tying optional?
+
+                x = self.post_dic_ln(x) # normalize after discretization
+
         if not skip_output:
-            x = self.to_token_logits(x)
+            x = self.embed_to_token_logits(x)
+
+        if return_intermediate_states:
+            return x, intermediate_states
+
         return x
 
     def compute_iteration(self, x):
@@ -113,6 +150,11 @@ class RecurrentTransformerModel(torch.nn.Module):
 
         return x
 
+# TODO: add some documentation
+# TODO: train config: soft_teacherforcing (i.e., add small loss on intermediate states to encourage teacher-forcing: intuition, soft "teacher-forcing", but with arbitrary data-driven order rather than causal order)
+# TODO: add logging/tracking of entropy of intermediate states (for now, can average across iters in train, but breakdown by iter in test)
+# TODO: make sure implementation of every step is correct... there are several places to make errors in implementation that could mess this up...
+# TODO: add more clever data sampling methods (e.g., weight proportional loss for each sequence length/# iters... does multiplicative weights make sense?)
 class LitRecurrentModel(pl.LightningModule):
     def __init__(self, model_config, data_config, train_config):
         super().__init__()
@@ -120,6 +162,8 @@ class LitRecurrentModel(pl.LightningModule):
         self.model_config = model_config
         self.data_config = data_config
         self.train_config = train_config
+
+        self.save_hyperparameters() # save model hyperparameters
 
         if train_config.compile:
             self.model = torch.compile(self.model)
@@ -134,6 +178,9 @@ class LitRecurrentModel(pl.LightningModule):
         return self.model(x, n_iters=n_iters)
 
     def sample_n_iters(self):
+        if np.random.random() < 1 - self.train_config.progressive_training_prob:
+            return (self.train_config.train_max_n_iters, 0)
+
         # randomly sample number of iterations to run model without tracking gradients
         if self.train_config.incremental_training:
             n_nograd_iters = np.random.randint(0, self.train_config.train_max_n_iters)
@@ -162,12 +209,12 @@ class LitRecurrentModel(pl.LightningModule):
 
         # run model without tracking gradients for n_nograd_iters
         # then run model with tracking gradients for n_iters
-        if self.train_config.incremental_training:
-            input_emb = self.model.embedder(x)
+        if self.train_config.incremental_training and n_nograd_iters > 0:
+            orig_input = x
             with torch.no_grad():
                 x = self.model(x, n_iters=n_nograd_iters, skip_embed=False, skip_output=True)
 
-            logits = self.model(x, input_emb=input_emb, n_iters=n_iters, skip_embed=True, skip_output=False)
+            logits = self.model(x, orig_input=orig_input, n_iters=n_iters, skip_embed=True, skip_output=False)
 
         # run model with tracking gradients for random number n_iters of iters
         else:
@@ -177,7 +224,7 @@ class LitRecurrentModel(pl.LightningModule):
 
         metrics = self.compute_metrics(batch, logits)
 
-        self.log_metrics(metrics, key_dir='train')
+        self.log_metrics(metrics, key_dir='train', prog_bar=True)
 
         self.log('train/n_nograd_iters', n_nograd_iters)
         self.log('train/n_iters', n_iters)
@@ -196,7 +243,7 @@ class LitRecurrentModel(pl.LightningModule):
         logits = self.model(x, n_iters=n_iters+n_nograd_iters)
 
         metrics = self.compute_metrics(batch, logits)
-        self.log_metrics(metrics, key_dir='val')
+        self.log_metrics(metrics, key_dir='val', prog_bar=True)
 
         return metrics['loss']
 
@@ -350,7 +397,7 @@ class LitRecurrentModel(pl.LightningModule):
         fig.add_vline(x=self.data_config.train_sequence_length, line_dash='dash', line_color='black', annotation_text='train_max_seq_len', annotation_position='bottom right')
         wandb.log({'test/ood_eval/per_token_acc_heatmap': wandb.Plotly(fig)})
 
-def get_discretization_amp(discretization_map_type: str, kwargs: dict):
+def get_discretization_map(discretization_map_type: str, kwargs: dict):
 
     if discretization_map_type == "gumbel-softmax":
         return partial(torch.nn.functional.gumbel_softmax, **kwargs)
@@ -376,7 +423,7 @@ def get_experiment_name(model_config, data_config, train_config):
     data_str = f'MaxVal{data_config.max_value}-TrainLen{data_config.train_sequence_length}'
     if data_config.get('train_random_sequence_length', False):
         data_str += f'RandLen'
-    model_str = f'L{model_config.n_layers}H{model_config.n_heads}D{model_config.d_model}_{model_config.pos_enc_type}_IR{model_config.input_recall}_WT{model_config.weight_tying}'
+    model_str = f'L{model_config.n_layers}H{model_config.n_heads}D{model_config.d_model}_{model_config.pos_enc_type}_IR{model_config.input_recall}_WT{model_config.weight_tie_embed_to_token}-{model_config.weight_tie_discrete_interm}'
 
     # attn_score_fn
     if model_config.attn_kwargs.attn_score_fn != 'softmax':
