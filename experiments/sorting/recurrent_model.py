@@ -44,7 +44,7 @@ class RecurrentTransformerModel(torch.nn.Module):
             # used for mapping discrete intermediate state to embedded state (optionally tied with embedding matrix)
             self.token_to_embed = torch.nn.Linear(model_config.vocab_size, model_config.d_model)
 
-        assert self.discretization_map is not None or not self.discrete_intermediate, "Discretization map must be provided for discrete intermediate."
+        assert not self.discrete_intermediate or self.discretization_map is not None, "Discretization map must be provided for discrete intermediate."
 
         # input recall (incorporates original input into hidden state at each recurrent iteration)
         self.input_recall = getattr(model_config, 'input_recall', False)
@@ -409,6 +409,8 @@ def get_discretization_map(discretization_map_type: str, kwargs: dict):
         return partial(topk_softmax, k=1, **kwargs)
     elif discretization_map_type == "sigmoid":
         return torch.nn.functional.sigmoid
+    elif discretization_map_type == "solu":
+        return lambda x: x * torch.nn.functional.softmax(x, dim=-1)
     elif discretization_map_type == "relu":
         return torch.nn.functional.relu
     elif discretization_map_type == "linear" or discretization_map_type is None:
@@ -416,6 +418,7 @@ def get_discretization_map(discretization_map_type: str, kwargs: dict):
     else:
         raise ValueError(f"Discretization map type {discretization_map_type} not valid.")
 
+# TODO: bound experiment name by 128
 def get_experiment_name(model_config, data_config, train_config):
     # Format:
     # Group: Model Config - Train Config - Data Config
@@ -423,6 +426,8 @@ def get_experiment_name(model_config, data_config, train_config):
     data_str = f'MaxVal{data_config.max_value}-TrainLen{data_config.train_sequence_length}'
     if data_config.get('train_random_sequence_length', False):
         data_str += f'RandLen'
+    if data_config.get('include_bos_eos', False):
+        data_str += '-BOSEOS'
     model_str = f'L{model_config.n_layers}H{model_config.n_heads}D{model_config.d_model}_{model_config.pos_enc_type}_IR{model_config.input_recall}_WT{model_config.weight_tie_embed_to_token}-{model_config.weight_tie_discrete_interm}'
 
     # attn_score_fn
@@ -435,6 +440,8 @@ def get_experiment_name(model_config, data_config, train_config):
         model_str += f'_discinterm-{model_config.intermediate_discretization.discretize_map}'
     else:
         model_str += '_discinterm-NA'
+    if model_config.predisc_norm or model_config.postdisc_norm:
+        model_str += f'_prepostdiscnorm-{model_config.predisc_norm}-{model_config.postdisc_norm}'
 
     # train config (progressive training and/or incremental training)
     train_str = ''
@@ -448,5 +455,12 @@ def get_experiment_name(model_config, data_config, train_config):
     run_name = datetime.now().strftime("%Y-%m-%d-%H:%M:%S")
     if getattr(train_config, 'seed', None) is not None:
         run_name = 'seed-' + str(train_config.seed) + ' - ' + run_name
+
+    # if exceeds 128 characters, save hash instead
+    if len(group_name) > 128:
+        group_name = 'HASH-' + str(hash(group_name))
+
+    if len(run_name) > 128:
+        run_name = 'HASH-' + str(hash(run_name))
 
     return group_name, run_name
