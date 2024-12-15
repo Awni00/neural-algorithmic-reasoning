@@ -53,6 +53,12 @@ for arg_str in unknown_args:
             print(f"Updated {prefix}{key} to {value}")
 
 # initialize wandb run
+# Group: Data Config - Model Config / Run name: Seed + Date-Time
+group_name, run_name = get_experiment_name(model_config, data_config, train_config)
+
+train_config.experiment_run_name = run_name
+train_config.experiment_group = group_name
+
 wandb_experiment_run = wandb.init(
     entity=train_config.wandb_config.wandb_entity, project=train_config.wandb_config.wandb_project,
     name=train_config.experiment_run_name, group=train_config.experiment_group)
@@ -83,8 +89,6 @@ train_config.seed = seed
 
 
 # data
-# FIXME TODO: add BEO and EOS to inputs?
-
 sorting_data_params = dict(
     max_value=data_config.max_value, sequence_length=data_config.train_sequence_length,
     batch_size=train_config.batch_size, random_sequence_length=data_config.train_random_sequence_length, min_sequence_length=data_config.train_min_sequence_length, device=None)
@@ -129,11 +133,6 @@ model_summary_dict = AttributeDict({
 
 
 # logger
-# Group: Data Config - Model Config / Run name: Seed + Date-Time
-group_name, run_name = get_experiment_name(model_config, data_config, train_config)
-
-train_config.experiment_run_name = run_name
-train_config.experiment_group = group_name
 
 experiment_config = dict(train_config=train_config, model_config=model_config, data_config=data_config, model_summary=model_summary_dict)
 wandb_experiment_run.config.update(experiment_config)
