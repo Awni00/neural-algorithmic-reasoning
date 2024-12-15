@@ -10,8 +10,7 @@ class EncoderBlock(nn.Module):
             pos_enc_model = None,
             dff: int = None,
             activation: str = 'relu',
-            norm_first: bool = True,
-            norm_type: str = 'layernorm',
+            norm_config: dict = None,
             dropout_rate: float = 0.0,
             bias: bool = True,
             causal: bool = False,
@@ -34,10 +33,9 @@ class EncoderBlock(nn.Module):
             intermediate dimension of feed-forward block.
         activation : str
             name of activation function to use in feed-forward block.
-        norm_first : bool
-            whether to apply layer normalization before or after attention.
-        norm_type: str, optional
-            type of normalization to use. 'layernorm' or 'rmsnorm'. Default is 'layernorm'.
+        norm_config: dict, optional
+            norm_type: specifies type of normalization to use ('layernorm' or 'rmsnorm'). Default is 'layernorm'.
+            norm_method: specifies whether to apply normalization before or after attention ('pre-norm' or 'post-norm'). Default is 'pre-norm'.
         dropout_rate : float
             dropout rate.
         bias : bool, optional
@@ -52,8 +50,10 @@ class EncoderBlock(nn.Module):
         self.dff = dff
         self.dropout_rate = dropout_rate
         self.activation = activation
-        self.norm_first = norm_first
-        self.norm_type = norm_type
+        self.norm_config = norm_config or {}
+        self.norm_method = self.norm_config.get('norm_method', 'pre-norm') # 'pre-norm' or 'post-norm' or 'none'
+        assert self.norm_method in ['pre-norm', 'post-norm', 'none'], f'norm_method {self.norm_method} not valid'
+        self.norm_type = self.norm_config.get('norm_type', 'layernorm')
         self.bias = bias
         self.attn_kwargs = {'n_kv_heads': None, 'add_bias_kv': False}
         if attn_kwargs is not None:
@@ -61,28 +61,35 @@ class EncoderBlock(nn.Module):
         self.causal = causal
 
         self.dropout = nn.Dropout(self.dropout_rate)
-        self.norm1 = create_norm(self.d_model, self.norm_type)
+        self.norm1 = create_norm(self.d_model, self.norm_type) if self.norm_method != 'none' else None
         self.self_attn = Attention(
             d_model=self.d_model, n_heads=self.n_heads, pos_enc_model=pos_enc_model,
             add_bias_out=self.bias, dropout=self.dropout_rate, **self.attn_kwargs)
-        self.norm2 = create_norm(self.d_model, self.norm_type)
+        self.norm2 = create_norm(self.d_model, self.norm_type) if self.norm_method != 'none' else None
         self.ff_block = FeedForwardBlock(self.d_model, dff=self.dff, activation=self.activation, use_bias=self.bias)
 
 
     def forward(self, x, need_weights=False):
-        if self.norm_first:
+        if self.norm_method == 'pre-norm':
             y = self._compute_self_attn(self.norm1(x), need_weights=need_weights)
             x = x + y
 
             y = self._apply_ff_block(self.norm2(x))
             x = x + y
-        else:
+        elif self.norm_method == 'post-norm':
             y = self._compute_self_attn(x, need_weights=need_weights)
             x = self.norm1(x + y)
 
             x = self.dropout(x)
             y = self._apply_ff_block(x)
             x = self.norm2(x + y)
+        else:
+            y = self._compute_self_attn(x, need_weights=need_weights)
+            x = x + y
+
+            x = self.dropout(x)
+            y = self._apply_ff_block(x)
+            x = x + y
         return x
 
     def _compute_self_attn(self, x, need_weights=False):
@@ -105,8 +112,7 @@ class DecoderBlock(nn.Module):
             pos_enc_model_ca = None,
             dff: int = None,
             activation: str = 'relu',
-            norm_first: bool = True,
-            norm_type: str = 'layernorm',
+            norm_config: dict = None,
             dropout_rate: float = 0.,
             bias: bool = True,
             causal: bool = False,
@@ -133,10 +139,9 @@ class DecoderBlock(nn.Module):
             intermediate dimension of feed-forward block.
         activation : str
             name of activation function to use in feed-forward block.
-        norm_first : bool
-            whether to apply layer normalization before or after attention.
-        norm_type: str, optional
-            type of normalization to use. 'layernorm' or 'rmsnorm'. Default is 'layernorm'.
+        norm_config: dict, optional
+            norm_type: specifies type of normalization to use ('layernorm' or 'rmsnorm'). Default is 'layernorm'.
+            norm_method: specifies whether to apply normalization before or after attention ('pre-norm' or 'post-norm'). Default is 'pre-norm'.
         dropout_rate : float
             dropout rate.
         bias : bool, optional
@@ -154,8 +159,10 @@ class DecoderBlock(nn.Module):
         self.dff = dff
         self.dropout_rate = dropout_rate
         self.activation = activation
-        self.norm_first = norm_first
-        self.norm_type = norm_type
+        self.norm_config = norm_config or {}
+        self.norm_method = self.norm_config.get('norm_method', 'pre-norm') # 'pre-norm' or 'post-norm' or 'none'
+        assert self.norm_method in ['pre-norm', 'post-norm', 'none'], f'norm_method {self.norm_method} not valid'
+        self.norm_type = self.norm_config.get('norm_type', 'layernorm')
         self.bias = bias
         self.causal = causal
         self.attn_kwargs = {'n_kv_heads': None, 'add_bias_kv': False}
@@ -163,27 +170,30 @@ class DecoderBlock(nn.Module):
             self.attn_kwargs.update(attn_kwargs)
 
         self.dropout = nn.Dropout(self.dropout_rate)
-        self.norm1 = create_norm(self.d_model, self.norm_type)
+        self.norm1 = create_norm(self.d_model, self.norm_type) if self.norm_method != 'none' else None
         self.self_attn = Attention(
             d_model=self.d_model, n_heads=self.n_heads, pos_enc_model=pos_enc_model_sa,
             add_bias_out=self.bias, dropout=self.dropout_rate, **self.attn_kwargs)
-        self.norm2 = create_norm(self.d_model, self.norm_type)
+        self.norm2 = create_norm(self.d_model, self.norm_type) if self.norm_method != 'none' else None
         self.cross_attn = Attention(
-            d_model=self.d_model, n_heads=self.n_heads, pos_enc_model=pos_enc_model_ca,
+            d_model=self.d_model, n_heads=self.n_heads_cross, pos_enc_model=pos_enc_model_ca,
             add_bias_out=self.bias, dropout=self.dropout_rate, **self.attn_kwargs)
-
-        self.norm3 = create_norm(self.d_model, self.norm_type)
+        self.norm3 = create_norm(self.d_model, self.norm_type) if self.norm_method != 'none' else None
         self.ff_block = FeedForwardBlock(self.d_model, dff=self.dff, activation=self.activation, use_bias=self.bias)
 
     def forward(self, x, context):
-        if self.norm_first:
+        if self.norm_method == 'pre-norm':
             x = x + self._compute_self_attn(self.norm1(x))
             x = x + self._compute_cross_attn(self.norm2(x), context)
-            x = x + self.ff_block(self.norm3(x))
-        else:
+            x = x + self._apply_ff_block(self.norm3(x))
+        elif self.norm_method == 'post-norm':
             x = self.norm1(x + self._compute_self_attn(x))
             x = self.norm2(x + self._compute_cross_attn(x, context))
-            x = self.norm3(x + self.ff_block(x))
+            x = self.norm3(x + self._apply_ff_block(x))
+        else:
+            x = x + self._compute_self_attn(x)
+            x = x + self._compute_cross_attn(x, context)
+            x = x + self._apply_ff_block(x)
         return x
 
     def _compute_self_attn(self, x, need_weights=False):
