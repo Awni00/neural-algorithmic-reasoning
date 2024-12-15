@@ -6,6 +6,7 @@ import torch
 from torch.utils.data import DataLoader
 import torchinfo
 
+import wandb
 import pytorch_lightning as pl
 from pytorch_lightning import Trainer
 from pytorch_lightning.callbacks import ModelCheckpoint, LearningRateMonitor
@@ -50,6 +51,11 @@ for arg_str in unknown_args:
                 config = config[k]
             config[key_parts[-1]] = value
             print(f"Updated {prefix}{key} to {value}")
+
+# initialize wandb run
+wandb_experiment_run = wandb.init(
+    entity=train_config.wandb_config.wandb_entity, project=train_config.wandb_config.wandb_project,
+    name=train_config.experiment_run_name, group=train_config.experiment_group)
 
 # print configs
 print('='*80)
@@ -130,10 +136,10 @@ train_config.experiment_run_name = run_name
 train_config.experiment_group = group_name
 
 experiment_config = dict(train_config=train_config, model_config=model_config, data_config=data_config, model_summary=model_summary_dict)
+wandb_experiment_run.config.update(experiment_config)
 
 logger = pl.loggers.WandbLogger(
-    entity=train_config.wandb_config.wandb_entity, project=train_config.wandb_config.wandb_project,
-    name=train_config.experiment_run_name, group=train_config.experiment_group,
+    experiment=wandb_experiment_run,
     config=experiment_config, log_model=train_config.wandb_config.log_model)
 
 if getattr(train_config.wandb_config, 'watch', False):
