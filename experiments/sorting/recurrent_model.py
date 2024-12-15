@@ -29,6 +29,7 @@ class RecurrentTransformerModel(torch.nn.Module):
         self.n_layers = model_config.n_layers
         self.dff = model_config.dff
         self.mlp_activation = getattr(model_config, 'mlp_activation', 'relu')
+        self.norm_config = getattr(model_config, 'norm_config', None)
         self.vocab_size = model_config.vocab_size
         self.pos_enc_type = model_config.pos_enc_type
         self.pos_enc_kwargs = getattr(model_config, 'pos_enc_kwargs', {})
@@ -61,7 +62,7 @@ class RecurrentTransformerModel(torch.nn.Module):
 
         # each recurrent step involves running a sequence of Transformer blocks (incl. attention + MLP)
         self.encoder = torch.nn.ModuleList([EncoderBlock(
-            d_model=self.d_model, n_heads=self.n_heads, dff=self.dff, activation=self.mlp_activation, 
+            d_model=self.d_model, n_heads=self.n_heads, dff=self.dff, activation=self.mlp_activation, norm_config=self.norm_config,
             pos_enc_model=self.get_pos_enc_model(attn=True), # positional encoding model for attention (e.g., RoPE, T5, etc.)
             attn_kwargs=self.attn_kwargs)
             for _ in range(model_config.n_layers)])
@@ -115,22 +116,34 @@ class RecurrentTransformerModel(torch.nn.Module):
         else:
             input_emb = self.embedder(orig_input)
 
-        intermediate_states = dict(disc_interm_states=[], logits_states=[])
+        if return_intermediate_states:
+            intermediate_states = dict(disc_interm_states=[], logits_states=[], emb_norms=[], logits_states_softmax_entropy=[], delta_norms=[])
 
         for iter in range(n_iters):
             if self.input_recall:
                 x = self.input_recall_combine(x, input_emb)
+            x_prev = x # used for tracking delta_norm
 
             x = self.compute_iteration(x)
+
+            if return_intermediate_states:
+                intermediate_states['delta_norms'].append((x - x_prev).norm(dim=-1))
+                intermediate_states['emb_norms'].append(x.norm(dim=-1))
 
             if self.discrete_intermediate:
                 x = self.pre_disc_ln(x) # normalize before discretization
 
                 x = self.embed_to_token_logits(x)
-                intermediate_states['logits_states'].append(x)
+                if return_intermediate_states:
+                    intermediate_states['logits_states'].append(x)
+                    # logits_states_softmax_entropy = (-x.float().softmax(dim=-1) * x.float().softmax(dim=-1).log2()).sum(dim=-1)
+                    logits_states_softmax_entropy = torch.special.entr(x.softmax(dim=-1)).sum(dim=-1)
+                    # note: torch.speecial.entr computes -x * ln(x) elementwise
+                    intermediate_states['logits_states_softmax_entropy'].append(logits_states_softmax_entropy)
 
                 x = self.discretization_map(x)
-                intermediate_states['disc_interm_states'].append(x)
+                if return_intermediate_states:
+                    intermediate_states['disc_interm_states'].append(x)
 
                 x = self.token_to_embed(x)
 
@@ -250,13 +263,27 @@ class LitRecurrentModel(pl.LightningModule):
     def test_step(self, batch, batch_idx=0, dataloader_idx=0):
 
         x, y = batch
-        n_iterss = range(1, self.train_config.test_max_n_iters+1)
 
+        ood_length = self.data_config.ood_test_sequence_lengths[dataloader_idx] # length of out-of-distribution sequence
+
+        # first, run model for max number of iterations, tracking intermediate states (to log entropy of logits, embedding norms, etc.)
+        logits, intermediate_states = self.model(x, n_iters=self.train_config.test_max_n_iters, return_intermediate_states=True)
+        # intermediate_states: Dict[str, List[torch.Tensor]] with keys: disc_interm_states, logits_states, emb_norms. List length = n_iters
+        assert len(intermediate_states['emb_norms']) == self.train_config.test_max_n_iters
+        assert len(intermediate_states['logits_states_softmax_entropy']) == self.train_config.test_max_n_iters
+
+        # for each number of iterations, compute metrics
+        n_iterss = range(1, self.train_config.test_max_n_iters+1)
         for n_iters in n_iterss:
             logits = self.model(x, n_iters=n_iters)
             metrics = self.compute_metrics(batch, logits)
 
-            ood_length = self.data_config.ood_test_sequence_lengths[dataloader_idx]
+            # average embedding norm over batch, sequence length
+            metrics['emb_norms'] = intermediate_states['emb_norms'][n_iters - 1].mean()
+            metrics['delta_norms'] = intermediate_states['delta_norms'][n_iters - 1].mean()
+            if self.model.discrete_intermediate:
+                # average entropy of discrete state logits over batch, sequence length
+                metrics['logits_states_softmax_entropy'] = intermediate_states['logits_states_softmax_entropy'][n_iters - 1].mean()
 
             self.test_step_outputs.append(dict(ood_length=ood_length, n_iters=n_iters, metrics=metrics))
 
@@ -294,6 +321,7 @@ class LitRecurrentModel(pl.LightningModule):
         sequence_acc = (predicted == y).all(dim=1).float().mean()
 
         metrics = dict(loss=loss, per_token_acc=per_token_acc, sequence_acc=sequence_acc)
+
         return metrics
 
     def log_metrics(self, metrics, prefix=None, key_dir=None, **log_kwargs):
@@ -397,6 +425,29 @@ class LitRecurrentModel(pl.LightningModule):
         fig.add_vline(x=self.data_config.train_sequence_length, line_dash='dash', line_color='black', annotation_text='train_max_seq_len', annotation_position='bottom right')
         wandb.log({'test/ood_eval/per_token_acc_heatmap': wandb.Plotly(fig)})
 
+        # heatmap of n_iters vs L vs emb_norms
+        heatmap = test_df.pivot(index='n_iters', columns='L')['emb_norms']
+        fig = px.imshow(heatmap, x=heatmap.columns, y=heatmap.index, title='Embedding Norms', origin='lower', color_continuous_scale='Hot')
+        fig.add_hline(y=self.train_config.train_max_n_iters, line_dash='dash', line_color='black', annotation_text='train_max_n_iters', annotation_position='bottom left')
+        fig.add_vline(x=self.data_config.train_sequence_length, line_dash='dash', line_color='black', annotation_text='train_max_seq_len', annotation_position='bottom right')
+        wandb.log({'test/ood_eval/emb_norms_heatmap': wandb.Plotly(fig)})
+
+        # heatmap of n_iters vs L vs delta_norms
+        heatmap = test_df.pivot(index='n_iters', columns='L')['delta_norms']
+        fig = px.imshow(heatmap, x=heatmap.columns, y=heatmap.index, title='Delta Norms', origin='lower', color_continuous_scale='Hot')
+        fig.add_hline(y=self.train_config.train_max_n_iters, line_dash='dash', line_color='black', annotation_text='train_max_n_iters', annotation_position='bottom left')
+        fig.add_vline(x=self.data_config.train_sequence_length, line_dash='dash', line_color='black', annotation_text='train_max_seq_len', annotation_position='bottom right')
+        wandb.log({'test/ood_eval/delta_norms_heatmap': wandb.Plotly(fig)})
+
+        # heatmap of n_iters vs L vs logits_states_softmax_entropy
+        if self.model.discrete_intermediate:
+            heatmap = test_df.pivot(index='n_iters', columns='L')['logits_states_softmax_entropy']
+            fig = px.imshow(heatmap, x=heatmap.columns, y=heatmap.index, title='Logits States Softmax Entropy', origin='lower', color_continuous_scale='Hot')
+            fig.add_hline(y=self.train_config.train_max_n_iters, line_dash='dash', line_color='black', annotation_text='train_max_n_iters', annotation_position='bottom left')
+            fig.add_vline(x=self.data_config.train_sequence_length, line_dash='dash', line_color='black', annotation_text='train_max_seq_len', annotation_position='bottom right')
+            wandb.log({'test/ood_eval/logits_states_softmax_entropy_heatmap': wandb.Plotly(fig)})
+
+
 def get_discretization_map(discretization_map_type: str, kwargs: dict):
 
     if discretization_map_type == "gumbel-softmax":
@@ -418,7 +469,6 @@ def get_discretization_map(discretization_map_type: str, kwargs: dict):
     else:
         raise ValueError(f"Discretization map type {discretization_map_type} not valid.")
 
-# TODO: bound experiment name by 128
 def get_experiment_name(model_config, data_config, train_config):
     # Format:
     # Group: Model Config - Train Config - Data Config
