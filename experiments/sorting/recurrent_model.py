@@ -253,10 +253,13 @@ class LitRecurrentModel(pl.LightningModule):
 
         # randomly sample n_iters for validation, as in training
         n_iters, n_nograd_iters = self.sample_n_iters()
-        logits = self.model(x, n_iters=n_iters+n_nograd_iters)
+        logits, intermediate_states = self.model(x, n_iters=n_iters+n_nograd_iters, return_intermediate_states=True)
 
         metrics = self.compute_metrics(batch, logits)
         self.log_metrics(metrics, key_dir='val', prog_bar=True)
+
+        intermediate_states_metrics = self.compute_intermediate_state_metrics(intermediate_states)
+        self.log_metrics(intermediate_states_metrics, key_dir='val_interm', prog_bar=False)
 
         return metrics['loss']
 
@@ -269,8 +272,8 @@ class LitRecurrentModel(pl.LightningModule):
         # first, run model for max number of iterations, tracking intermediate states (to log entropy of logits, embedding norms, etc.)
         logits, intermediate_states = self.model(x, n_iters=self.train_config.test_max_n_iters, return_intermediate_states=True)
         # intermediate_states: Dict[str, List[torch.Tensor]] with keys: disc_interm_states, logits_states, emb_norms. List length = n_iters
-        assert len(intermediate_states['emb_norms']) == self.train_config.test_max_n_iters
-        assert len(intermediate_states['logits_states_softmax_entropy']) == self.train_config.test_max_n_iters
+        assert len(intermediate_states['emb_norms']) == self.train_config.test_max_n_iters, f"Expected {self.train_config.test_max_n_iters} intermediate states, got {len(intermediate_states['emb_norms'])}"
+        assert len(intermediate_states['logits_states_softmax_entropy']) == self.train_config.test_max_n_iters, f"Expected {self.train_config.test_max_n_iters} intermediate states, got {len(intermediate_states['logits_states_softmax_entropy'])}"
 
         # for each number of iterations, compute metrics
         n_iterss = range(1, self.train_config.test_max_n_iters+1)
@@ -323,6 +326,18 @@ class LitRecurrentModel(pl.LightningModule):
         metrics = dict(loss=loss, per_token_acc=per_token_acc, sequence_acc=sequence_acc)
 
         return metrics
+
+    def compute_intermediate_state_metrics(self, intermediate_states):
+
+        intermediate_states_metrics = dict()
+        # compute avg entropy over batch, sequence length
+        intermediate_states_metrics['avg_emb_norms'] = torch.stack(intermediate_states['emb_norms']).mean()
+        intermediate_states_metrics['avg_delta_norms'] = torch.stack(intermediate_states['delta_norms']).mean()
+        if self.model.discrete_intermediate:
+            intermediate_states_metrics['avg_logits_states_softmax_entropy'] = torch.stack(intermediate_states['logits_states_softmax_entropy']).mean()
+
+        return intermediate_states_metrics
+
 
     def log_metrics(self, metrics, prefix=None, key_dir=None, **log_kwargs):
         for key, value in metrics.items():
