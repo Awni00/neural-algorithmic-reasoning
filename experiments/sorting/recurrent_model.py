@@ -273,7 +273,8 @@ class LitRecurrentModel(pl.LightningModule):
         logits, intermediate_states = self.model(x, n_iters=self.train_config.test_max_n_iters, return_intermediate_states=True)
         # intermediate_states: Dict[str, List[torch.Tensor]] with keys: disc_interm_states, logits_states, emb_norms. List length = n_iters
         assert len(intermediate_states['emb_norms']) == self.train_config.test_max_n_iters, f"Expected {self.train_config.test_max_n_iters} intermediate states, got {len(intermediate_states['emb_norms'])}"
-        assert len(intermediate_states['logits_states_softmax_entropy']) == self.train_config.test_max_n_iters, f"Expected {self.train_config.test_max_n_iters} intermediate states, got {len(intermediate_states['logits_states_softmax_entropy'])}"
+        if self.model.discrete_intermediate:
+            assert len(intermediate_states['logits_states_softmax_entropy']) == self.train_config.test_max_n_iters, f"Expected {self.train_config.test_max_n_iters} intermediate states, got {len(intermediate_states['logits_states_softmax_entropy'])}"
 
         # for each number of iterations, compute metrics
         n_iterss = range(1, self.train_config.test_max_n_iters+1)
