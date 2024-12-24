@@ -1,6 +1,7 @@
 import torch
 import torch.nn as nn
 from .attention import Attention
+from .residual_stream import ResidualStreamBlock, create_norm
 
 class EncoderBlock(nn.Module):
 
@@ -50,10 +51,7 @@ class EncoderBlock(nn.Module):
         self.dff = dff
         self.dropout_rate = dropout_rate
         self.activation = activation
-        self.norm_config = norm_config or {}
-        self.norm_method = self.norm_config.get('norm_method', 'pre-norm') # 'pre-norm' or 'post-norm' or 'none'
-        assert self.norm_method in ['pre-norm', 'post-norm', 'none'], f'norm_method {self.norm_method} not valid'
-        self.norm_type = self.norm_config.get('norm_type', 'layernorm')
+        self.norm_config = norm_config
         self.bias = bias
         self.attn_kwargs = {'n_kv_heads': None, 'add_bias_kv': False}
         if attn_kwargs is not None:
@@ -61,35 +59,23 @@ class EncoderBlock(nn.Module):
         self.causal = causal
 
         self.dropout = nn.Dropout(self.dropout_rate)
-        self.norm1 = create_norm(self.d_model, self.norm_type) if self.norm_method != 'none' else None
+        self.residual_stream_block_attn = ResidualStreamBlock(self.d_model, norm_config=self.norm_config)
         self.self_attn = Attention(
             d_model=self.d_model, n_heads=self.n_heads, pos_enc_model=pos_enc_model,
             add_bias_out=self.bias, dropout=self.dropout_rate, **self.attn_kwargs)
-        self.norm2 = create_norm(self.d_model, self.norm_type) if self.norm_method != 'none' else None
+
+        self.residual_stream_block_ff = ResidualStreamBlock(self.d_model, norm_config=self.norm_config)
         self.ff_block = FeedForwardBlock(self.d_model, dff=self.dff, activation=self.activation, use_bias=self.bias)
 
 
     def forward(self, x, need_weights=False):
-        if self.norm_method == 'pre-norm':
-            y = self._compute_self_attn(self.norm1(x), need_weights=need_weights)
-            x = x + y
 
-            y = self._apply_ff_block(self.norm2(x))
-            x = x + y
-        elif self.norm_method == 'post-norm':
-            y = self._compute_self_attn(x, need_weights=need_weights)
-            x = self.norm1(x + y)
+        # self-attention + residual + norm
+        x = self.residual_stream_block_attn(x, self._compute_self_attn, need_weights=need_weights)
 
-            x = self.dropout(x)
-            y = self._apply_ff_block(x)
-            x = self.norm2(x + y)
-        else:
-            y = self._compute_self_attn(x, need_weights=need_weights)
-            x = x + y
+        # feed-forward + residual + norm
+        x = self.residual_stream_block_ff(x, self._apply_ff_block)
 
-            x = self.dropout(x)
-            y = self._apply_ff_block(x)
-            x = x + y
         return x
 
     def _compute_self_attn(self, x, need_weights=False):
@@ -159,10 +145,7 @@ class DecoderBlock(nn.Module):
         self.dff = dff
         self.dropout_rate = dropout_rate
         self.activation = activation
-        self.norm_config = norm_config or {}
-        self.norm_method = self.norm_config.get('norm_method', 'pre-norm') # 'pre-norm' or 'post-norm' or 'none'
-        assert self.norm_method in ['pre-norm', 'post-norm', 'none'], f'norm_method {self.norm_method} not valid'
-        self.norm_type = self.norm_config.get('norm_type', 'layernorm')
+        self.norm_config = norm_config
         self.bias = bias
         self.causal = causal
         self.attn_kwargs = {'n_kv_heads': None, 'add_bias_kv': False}
@@ -170,30 +153,31 @@ class DecoderBlock(nn.Module):
             self.attn_kwargs.update(attn_kwargs)
 
         self.dropout = nn.Dropout(self.dropout_rate)
-        self.norm1 = create_norm(self.d_model, self.norm_type) if self.norm_method != 'none' else None
+
+        self.residual_stream_block_selfattn = ResidualStreamBlock(self.d_model, norm_config=self.norm_config)
         self.self_attn = Attention(
             d_model=self.d_model, n_heads=self.n_heads, pos_enc_model=pos_enc_model_sa,
             add_bias_out=self.bias, dropout=self.dropout_rate, **self.attn_kwargs)
-        self.norm2 = create_norm(self.d_model, self.norm_type) if self.norm_method != 'none' else None
+
+        self.residual_stream_block_crossattn = ResidualStreamBlock(self.d_model, norm_config=self.norm_config)
         self.cross_attn = Attention(
             d_model=self.d_model, n_heads=self.n_heads_cross, pos_enc_model=pos_enc_model_ca,
             add_bias_out=self.bias, dropout=self.dropout_rate, **self.attn_kwargs)
-        self.norm3 = create_norm(self.d_model, self.norm_type) if self.norm_method != 'none' else None
+
+        self.residual_stream_block_ff = ResidualStreamBlock(self.d_model, norm_config=self.norm_config)
         self.ff_block = FeedForwardBlock(self.d_model, dff=self.dff, activation=self.activation, use_bias=self.bias)
 
     def forward(self, x, context):
-        if self.norm_method == 'pre-norm':
-            x = x + self._compute_self_attn(self.norm1(x))
-            x = x + self._compute_cross_attn(self.norm2(x), context)
-            x = x + self._apply_ff_block(self.norm3(x))
-        elif self.norm_method == 'post-norm':
-            x = self.norm1(x + self._compute_self_attn(x))
-            x = self.norm2(x + self._compute_cross_attn(x, context))
-            x = self.norm3(x + self._apply_ff_block(x))
-        else:
-            x = x + self._compute_self_attn(x)
-            x = x + self._compute_cross_attn(x, context)
-            x = x + self._apply_ff_block(x)
+
+        # self-attention + residual + norm
+        x = self.residual_stream_block_selfattn(x, self._compute_self_attn)
+
+        # cross-attention + residual + norm
+        x = self.residual_stream_block_crossattn(x, self._compute_cross_attn, context=context)
+
+        # feed-forward + residual + norm
+        x = self.residual_stream_block_ff(x, self._apply_ff_block)
+
         return x
 
     def _compute_self_attn(self, x, need_weights=False):
@@ -268,29 +252,6 @@ class FeedForwardBlock(nn.Module):
             x = self.activation_(x)
             x = self.linear2(x)
             return x
-
-class RMSNorm(torch.nn.Module):
-    def __init__(self, dim: int, eps: float=1e-5):
-        super().__init__()
-        self.eps = eps
-        self.weight = nn.Parameter(torch.ones(dim))
-
-    def _norm(self, x):
-        return x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps)
-
-    def forward(self, x):
-        output = self._norm(x.float()).type_as(x)
-        return output * self.weight
-
-def create_norm(d_model, norm_type):
-    if norm_type=='layernorm':
-        return nn.LayerNorm(d_model)
-    elif norm_type=='rmsnorm':
-        return RMSNorm(d_model)
-    elif norm_type=='none':
-        return  nn.Identity()
-    else:
-        raise ValueError(f'norm_type {norm_type} not valid')
 
 def get_activation_function(name):
     """gets activation function by its name."""
