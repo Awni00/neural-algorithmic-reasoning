@@ -13,13 +13,52 @@ from datetime import datetime
 
 from models.transformer_blocks import EncoderBlock
 from models.positional_encoding import ScaledSinusoidalEmbedding, AbsolutePositionalEmbedding, AlibiPositionalBias, T5RelativePositionBias, RotaryPositionalEmbeddings
-from models.misc import ConcatCombine
+from models.residual_stream import ConcatCombine, create_norm
 from models.attention_utils import topk_softmax
 
 # model_config: temparature annealing (TODO)
 # model_config: intermediate_compute_vocab (TODO) [additional vocab for intermediate states] [how to interact with weight-tying??]
 class RecurrentTransformerModel(torch.nn.Module):
+    """
+    Recurrent Transformer Model.
+
+    This model consists of a stack of Transformer encoder blocks, which are applied recurrently to the input sequence.
+    The model can optionally use discrete intermediate states, input recall, and various types of positional encodings.
+
+    Parameters
+    ----------
+    model_config : dict
+        Configuration dictionary containing the following keys:
+        - d_model (int): Dimension of the model.
+        - n_heads (int): Number of attention heads.
+        - n_layers (int): Number of Transformer layers.
+        - dff (int): Dimension of the feed-forward layer.
+        - mlp_activation (str): Activation function for the feed-forward layer.
+        - norm_config (dict): Configuration for normalization layers.
+        - vocab_size (int): Size of the vocabulary.
+        - pos_enc_type (str): Type of positional encoding to use.
+        - pos_enc_kwargs (dict): Additional arguments for positional encoding.
+        - attn_kwargs (dict): Additional arguments for attention layers.
+        - intermediate_discretization (dict): Configuration for intermediate discretization.
+        - input_recall (bool): Whether to use input recall.
+        - input_recall_type (str): Type of input recall ('add' or 'concat').
+        - predisc_norm (bool): Whether to apply normalization before discretization.
+        - postdisc_norm (bool): Whether to apply normalization after discretization.
+        - weight_tie_embed_to_token (bool): Whether to tie the embedding and token projection weights.
+        - weight_tie_discrete_interm (bool): Whether to tie the weights for discrete intermediate states.
+
+    Methods
+    -------
+    get_pos_enc_model(attn=True):
+        Returns the positional encoding model based on the configuration.
+    forward(x, n_iters=1, skip_embed=False, orig_input=None, skip_output=False, return_intermediate_states=False):
+        Forward pass of the model.
+    compute_iteration(x):
+        Computes a single iteration of the model.
+    """
+
     def __init__(self, model_config):
+
         super(RecurrentTransformerModel, self).__init__()
         self.model_config = model_config
 
@@ -66,13 +105,14 @@ class RecurrentTransformerModel(torch.nn.Module):
             pos_enc_model=self.get_pos_enc_model(attn=True), # positional encoding model for attention (e.g., RoPE, T5, etc.)
             attn_kwargs=self.attn_kwargs)
             for _ in range(model_config.n_layers)])
+        self.prelogits_norm = create_norm(self.d_model, self.norm_config.get('norm_type', 'layernorm'))
         self.embed_to_token_logits = torch.nn.Linear(model_config.d_model, model_config.vocab_size)
 
         # pre-discretization layernorm
         # note: if logits have large magnitude, gradient of softmax will be small, making training difficult
         # layernorm can help with this
-        self.pre_disc_ln = torch.nn.LayerNorm(model_config.d_model) if model_config.predisc_norm else torch.nn.Identity()
-        self.post_dic_ln = torch.nn.LayerNorm(model_config.d_model) if model_config.postdisc_norm else torch.nn.Identity()
+        self.pre_disc_ln = create_norm(self.d_model, self.norm_config.get('norm_type', 'layernorm')) if model_config.predisc_norm else torch.nn.Identity()
+        self.post_dic_ln = create_norm(self.d_model, self.norm_config.get('norm_type', 'layernorm')) if model_config.postdisc_norm else torch.nn.Identity()
 
         # weight tying
         self.weight_tie_embed_to_token = getattr(model_config, 'weight_tie_embed_to_token', False)
@@ -120,9 +160,10 @@ class RecurrentTransformerModel(torch.nn.Module):
             intermediate_states = dict(disc_interm_states=[], logits_states=[], emb_norms=[], logits_states_softmax_entropy=[], delta_norms=[])
 
         for iter in range(n_iters):
+            x_prev = x
+
             if self.input_recall:
                 x = self.input_recall_combine(x, input_emb)
-            x_prev = x # used for tracking delta_norm
 
             x = self.compute_iteration(x)
 
@@ -150,6 +191,7 @@ class RecurrentTransformerModel(torch.nn.Module):
                 x = self.post_dic_ln(x) # normalize after discretization
 
         if not skip_output:
+            x = self.prelogits_norm(x)
             x = self.embed_to_token_logits(x)
 
         if return_intermediate_states:
@@ -165,10 +207,53 @@ class RecurrentTransformerModel(torch.nn.Module):
 
 # TODO: add some documentation
 # TODO: train config: soft_teacherforcing (i.e., add small loss on intermediate states to encourage teacher-forcing: intuition, soft "teacher-forcing", but with arbitrary data-driven order rather than causal order)
-# TODO: add logging/tracking of entropy of intermediate states (for now, can average across iters in train, but breakdown by iter in test)
 # TODO: make sure implementation of every step is correct... there are several places to make errors in implementation that could mess this up...
 # TODO: add more clever data sampling methods (e.g., weight proportional loss for each sequence length/# iters... does multiplicative weights make sense?)
 class LitRecurrentModel(pl.LightningModule):
+    """
+    Lightning Module for training and evaluating the RecurrentTransformerModel.
+
+    This class handles the training, validation, and testing of the Recurrent Transformer Model using PyTorch Lightning.
+
+    Parameters
+    ----------
+    model_config : dict
+        Configuration dictionary for the model.
+    data_config : dict
+        Configuration dictionary for the data.
+    train_config : dict
+        Configuration dictionary for the training process.
+
+    Methods
+    -------
+    forward(x, n_iters):
+        Forward pass of the model.
+    sample_n_iters():
+        Samples the number of iterations for training.
+    training_step(batch):
+        Defines the training step.
+    validation_step(batch):
+        Defines the validation step.
+    test_step(batch, batch_idx=0, dataloader_idx=0):
+        Defines the test step.
+    on_test_epoch_end():
+        Called at the end of the test epoch to log metrics.
+    compute_metrics(batch, logits):
+        Computes the metrics for a given batch and logits.
+    compute_intermediate_state_metrics(intermediate_states):
+        Computes metrics for intermediate states.
+    log_metrics(metrics, prefix=None, key_dir=None, **log_kwargs):
+        Logs the metrics.
+    configure_optimizers():
+        Configures the optimizers and learning rate schedulers.
+    lr_scheduler_step(scheduler, metric):
+        Steps the learning rate scheduler.
+    on_before_optimizer_step(optimizer):
+        Called before the optimizer step to log gradient norms.
+    create_and_log_figs(test_df):
+        Creates and logs figures for test metrics.
+    """
+
     def __init__(self, model_config, data_config, train_config):
         super().__init__()
         self.model = RecurrentTransformerModel(model_config)
