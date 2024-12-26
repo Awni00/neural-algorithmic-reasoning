@@ -1,6 +1,7 @@
 import torch
 from typing import Any, Optional, Tuple
 from functools import partial
+from .adaptive_temperature_softmax import AdaptiveTemperatureSoftmax
 
 
 def repeat_kv(x: torch.Tensor, n_rep: int) -> torch.Tensor:
@@ -128,6 +129,8 @@ def get_attention_function(activation: str, kwargs: dict) -> Any:
 
     if activation == "softmax":
         return partial(torch.nn.functional.softmax, dim=-1)
+    if activation == 'adaptive-temperature-softmax':
+        return AdaptiveTemperatureSoftmax(**kwargs)
     elif activation == "topk-softmax":
         return partial(topk_softmax, **kwargs)
     elif activation == "hard":
@@ -142,6 +145,8 @@ def get_attention_function(activation: str, kwargs: dict) -> Any:
         raise ValueError(f"Activation function {activation} not valid.")
 # endregion
 
-# TODO: implement different similarity functions 
+# TODO: implement different similarity functions
 # TODO: e.g., Selective Attention, which masks *future* tokens: https://arxiv.org/pdf/2410.02703
 # TODO: allow for more finegrained control over backend to use in torch.nn.functional.scaled_dot_product_attention: https://pytorch.org/docs/stable/generated/torch.nn.attention.sdpa_kernel.html
+
+# TODO: consider implmenting a "Quiet Attention" as described in https://www.evanmiller.org/attention-is-off-by-one.html
