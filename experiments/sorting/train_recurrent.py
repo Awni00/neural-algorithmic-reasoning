@@ -1,6 +1,7 @@
 import argparse
 import yaml
 import ast
+import math
 import numpy as np
 import torch
 from torch.utils.data import DataLoader
@@ -59,9 +60,10 @@ group_name, run_name = get_experiment_name(model_config, data_config, train_conf
 train_config.experiment_run_name = run_name
 train_config.experiment_group = group_name
 
-wandb_experiment_run = wandb.init(
-    entity=train_config.wandb_config.wandb_entity, project=train_config.wandb_config.wandb_project,
-    name=train_config.experiment_run_name, group=train_config.experiment_group)
+if not args.debug:
+    wandb_experiment_run = wandb.init(
+        entity=train_config.wandb_config.wandb_entity, project=train_config.wandb_config.wandb_project,
+        name=train_config.experiment_run_name, group=train_config.experiment_group)
 
 # print configs
 print('='*80)
@@ -89,23 +91,27 @@ train_config.seed = seed
 
 
 # data
+n_train_batches = math.ceil(data_config.num_train_samples / train_config.batch_size)
+n_val_batches = math.ceil(data_config.num_val_samples / train_config.batch_size)
+n_test_batches = math.ceil(data_config.num_test_samples / train_config.batch_size)
+
 sorting_data_params = dict(
     max_value=data_config.max_value, sequence_length=data_config.train_sequence_length,
     batch_size=train_config.batch_size, random_sequence_length=data_config.train_random_sequence_length, min_sequence_length=data_config.train_min_sequence_length, device=None)
-train_ds = SortingDataset(**sorting_data_params, num_samples=data_config.num_train_samples)
+train_ds = SortingDataset(**sorting_data_params, num_samples=n_train_batches)
 train_dataloader = DataLoader(train_ds, batch_size=None, shuffle=True, num_workers=train_config.num_workers, pin_memory=True)
 
-val_ds = SortingDataset(**sorting_data_params, num_samples=data_config.num_val_samples)
+val_ds = SortingDataset(**sorting_data_params, num_samples=n_val_batches)
 val_dataloader = DataLoader(val_ds, batch_size=None, shuffle=False, num_workers=train_config.num_workers, pin_memory=True)
 
 ood_test_dss = [
     SortingDataset(max_value=data_config.max_value, sequence_length=ood_seq_len, random_sequence_length=False,
-        batch_size=train_config.batch_size, num_samples=data_config.num_test_samples)
+        batch_size=train_config.batch_size, num_samples=n_test_batches)
     for ood_seq_len in data_config.ood_test_sequence_lengths]
 ood_test_dataloaders = [
     DataLoader(ood_test_ds, batch_size=None, shuffle=False, num_workers=train_config.num_workers, pin_memory=True)
     for ood_test_ds in ood_test_dss]
-
+# note: here, batch_size=None because dataset already returns batches
 
 # create model
 model_config.vocab_size = data_config.max_value
@@ -113,7 +119,10 @@ model_config.vocab_size = data_config.max_value
 litmodel = LitRecurrentModel(model_config=model_config, train_config=train_config, data_config=data_config)
 
 # get torchinfo summary
-model_summary = torchinfo.summary(litmodel.model, input_data=torch.zeros((1, data_config.train_sequence_length), dtype=torch.long),
+print(litmodel.model)
+print()
+
+model_summary = torchinfo.summary(litmodel.model, input_data=torch.zeros((train_config.batch_size, data_config.train_sequence_length), dtype=torch.long),
     col_names=("input_size", "output_size", "num_params", "params_percent"))
 print(model_summary)
 
@@ -135,14 +144,16 @@ model_summary_dict = AttributeDict({
 # logger
 
 experiment_config = dict(train_config=train_config, model_config=model_config, data_config=data_config, model_summary=model_summary_dict)
-wandb_experiment_run.config.update(experiment_config)
 
-logger = pl.loggers.WandbLogger(
-    experiment=wandb_experiment_run,
-    config=experiment_config, log_model=train_config.wandb_config.log_model)
+if not args.debug:
+    wandb_experiment_run.config.update(experiment_config)
 
-if getattr(train_config.wandb_config, 'watch', False):
-    logger.watch(litmodel.model, log='all', log_graph=True)
+    logger = pl.loggers.WandbLogger(
+        experiment=wandb_experiment_run,
+        config=experiment_config, log_model=train_config.wandb_config.log_model)
+
+    if getattr(train_config.wandb_config, 'watch', False):
+        logger.watch(litmodel.model, log='all', log_graph=True)
 
 # callbacks: checkpoint and lr monitor
 checkpoint_dir = f'checkpoints/{train_config.experiment_group}-{train_config.experiment_run_name}'
