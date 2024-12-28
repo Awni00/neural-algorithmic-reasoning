@@ -70,8 +70,8 @@ class LitTransformerLM(pl.LightningModule):
             cosine_scheduler_config = self.train_config.cosine_scheduler_config
             scheduler = get_cosine_schedule_with_warmup(
                 optimizer=optimizer,
-                num_warmup_steps=cosine_scheduler_config.get('num_warmup_steps', self.train_config.max_steps // 10),
-                num_training_steps=self.train_config.max_steps
+                num_warmup_steps=cosine_scheduler_config.get('num_warmup_steps', self.train_config.n_train_steps // 10),
+                num_training_steps=self.train_config.n_train_steps
             )
 
         elif self.train_config.lr_scheduler == "step":

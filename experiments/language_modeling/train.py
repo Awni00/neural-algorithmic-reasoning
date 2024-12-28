@@ -123,6 +123,7 @@ if train_config.log_every_n_steps is None:
 # dynamically choose micro batch size, gradient accumulation steps, number of training steps, etc...
 
 n_train_microsteps = len(train_loader)
+train_config.n_train_steps = n_train_microsteps # used by the learning rate scheduler
 
 print('='*80)
 print(f'Total # of Training Tokens: {format_large_number(train_data.num_tokens)}')
