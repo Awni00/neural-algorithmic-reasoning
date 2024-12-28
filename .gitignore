@@ -15,6 +15,10 @@ experiments/**/experiment_configs/**
 
 # checkpoint files
 experiments/**/checkpoints/**
+experiments/**/artifacts/**
+
+# data files
+experiments/**/data/**
 
 # slurm stuff
 jobs/**/*.job
