@@ -105,6 +105,9 @@ class RecurrentTransformerModel(torch.nn.Module):
             pos_enc_model=self.get_pos_enc_model(attn=True), # positional encoding model for attention (e.g., RoPE, T5, etc.)
             attn_kwargs=self.attn_kwargs)
             for _ in range(model_config.n_layers)])
+
+        # TODO / FIXME: maybe make to_logits = nn.Sequential(norm, embed_to_token logits), with shared norm, and remove predisc_norm, postdisc_norm?
+        # also, only use norm if pre-LN not post-LN?
         self.prelogits_norm = create_norm(self.d_model, self.norm_config.get('norm_type', 'layernorm'))
         self.embed_to_token_logits = torch.nn.Linear(model_config.d_model, model_config.vocab_size)
 
@@ -140,8 +143,10 @@ class RecurrentTransformerModel(torch.nn.Module):
             return T5RelativePositionBias(heads=self.n_heads, **self.pos_enc_kwargs) # can specify num_buckets, max_distance in pos_enc_kwargs (default 32, 128)
         elif self.pos_enc_type == 'rotary':
             return RotaryPositionalEmbeddings(dim=self.d_head, **self.pos_enc_kwargs)
-        else:
+        elif self.pos_enc_type == 'none' or ((self.pos_enc_type in ['sinusoidal', 'learned']) and attn):
             return None
+        else:
+            raise ValueError(f"pos_enc_type {self.pos_enc_type} not recognized")
 
     def forward(self, x, n_iters=1, skip_embed=False, orig_input=None, skip_output=False, return_intermediate_states=False):
 
@@ -336,6 +341,8 @@ class LitRecurrentModel(pl.LightningModule):
 
         x, y = batch
 
+        self.model.eval() # set model to evaluation mode
+
         # randomly sample n_iters for validation, as in training
         n_iters, n_nograd_iters = self.sample_n_iters()
         logits, intermediate_states = self.model(x, n_iters=n_iters+n_nograd_iters, return_intermediate_states=True)
@@ -351,6 +358,8 @@ class LitRecurrentModel(pl.LightningModule):
     def test_step(self, batch, batch_idx=0, dataloader_idx=0):
 
         x, y = batch
+
+        self.model.eval() # set model to evaluation mode
 
         ood_length = self.data_config.ood_test_sequence_lengths[dataloader_idx] # length of out-of-distribution sequence
 
