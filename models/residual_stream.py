@@ -2,7 +2,7 @@ import torch
 import torch.nn as nn
 from functools import partial
 
-VALID_NORM_METHODS = ['pre-norm', 'post-norm', 'pre+post-norm', 'hypersphere-interpolation', 'none']
+VALID_NORM_METHODS = ['pre-norm', 'post-norm', 'pre+post-norm', 'hypersphere-interpolation', 'hypersphere-spherical-interpolation', 'adaptive-hypersphere-interpolation', 'none']
 class ResidualStreamBlock(nn.Module):
     def __init__(self, dim, norm_config=None):
         """This Module applies a residual connection to the input of a model_func, with optional normalization before and/or after the model_func.
@@ -34,12 +34,19 @@ class ResidualStreamBlock(nn.Module):
             self.post_norm = create_norm(self.dim, self.norm_type) if self.norm_method != 'none' else None
 
         elif self.norm_method == 'hypersphere-interpolation':
-            lerp_scale = self.norm_config.get('lerp_scale', self.dim ** 0.5)
-            lerp_init = self.norm_config.get('lerp_init', 1.0) # NOTE: can be set 1 / n_layers
-            self.forward_lerp_weight_scale = lerp_init / lerp_scale
-            self.lerp_weight = nn.Parameter(torch.ones(self.dim) * lerp_scale, requires_grad=True)
+            # use only valid kwargs in norm_config
+            self.res_stream = HypersphereLERP(dim, lerp_weight_constraint=self.norm_config.get('lerp_weight_constraint', 'none'))
+            # lerp_scale = self.norm_config.get('lerp_scale', self.dim ** 0.5)
+            # lerp_init = self.norm_config.get('lerp_init', 1.0) # NOTE: can be set 1 / n_layers
+            # self.forward_lerp_weight_scale = lerp_init / lerp_scale
+            # self.lerp_weight = nn.Parameter(torch.ones(self.dim) * lerp_scale, requires_grad=True)
 
             # note: norm_type is not used here, we always normalize to unit-norm hypersphere
+        elif self.norm_method == 'hypersphere-spherical-interpolation':
+            self.res_stream = HypersphereSLERP(dim, single_weight=self.norm_config.get('single_weight', True))
+
+        elif self.norm_method == 'adaptive-hypersphere-interpolation':
+            self.res_stream = AdaptiveHypersphereSLERP(dim, single_weight=self.norm_config.get('single_weight', True))
 
         elif self.norm_method == 'none':
             pass
@@ -67,14 +74,14 @@ class ResidualStreamBlock(nn.Module):
             y = model_func(self.pre_norm(x), **model_kwargs)
             x = self.post_norm(x + y)
 
-        elif self.norm_method == 'hypersphere-interpolation':
+        elif self.norm_method in ['hypersphere-interpolation', 'hypersphere-spherical-interpolation', 'adaptive-hypersphere-interpolation']:
             y = model_func(x, **model_kwargs)
-            y = torch.nn.functional.normalize(y, p=2, dim=-1) # normalize to hypersphere (unit-norm)
+            # y = torch.nn.functional.normalize(y, p=2, dim=-1) # normalize to hypersphere (unit-norm)
 
-            # x = torch.lerp(x, y, self.lerp_weight * self.forward_lerp_weight_scale) # interpolate between x and y = func(x)
-            x = x + (self.lerp_weight * self.forward_lerp_weight_scale) * (y - x) # interpolate between x and y = func(x)
-            x = torch.nn.functional.normalize(x, p=2, dim=-1) # normalize to hypersphere (unit-norm)
-
+            # # x = torch.lerp(x, y, self.lerp_weight * self.forward_lerp_weight_scale) # interpolate between x and y = func(x)
+            # x = x + (self.lerp_weight * self.forward_lerp_weight_scale) * (y - x) # interpolate between x and y = func(x)
+            # x = torch.nn.functional.normalize(x, p=2, dim=-1) # normalize to hypersphere (unit-norm)
+            x = self.res_stream(x, y)
         else:
             raise ValueError(f'norm_method {self.norm_method} not valid; must be in {VALID_NORM_METHODS}')
 
