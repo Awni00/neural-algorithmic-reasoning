@@ -43,8 +43,8 @@ class LitTransformerLM(pl.LightningModule):
         logits = self.model(x)
         loss = self.criterion(logits.view(-1, logits.size(-1)), y.contiguous().view(-1))
 
-        self.log('val/loss', loss, on_step=True, on_epoch=True, prog_bar=True, logger=True)
-        self.log('val/ppl', torch.exp(loss), on_step=True, on_epoch=True, prog_bar=True, logger=True)
+        self.log('val/loss', loss, prog_bar=True, logger=True)
+        self.log('val/ppl', torch.exp(loss), prog_bar=True, logger=True)
         return loss
 
     def configure_optimizers(self):
