@@ -2,6 +2,7 @@ import torch
 import torch.nn as nn
 from .attention import Attention
 from .residual_stream import ResidualStreamBlock, create_norm
+from functools import partial
 
 class EncoderBlock(nn.Module):
 
@@ -36,7 +37,7 @@ class EncoderBlock(nn.Module):
             name of activation function to use in feed-forward block.
         norm_config: dict, optional
             norm_type: specifies type of normalization to use ('layernorm' or 'rmsnorm'). Default is 'layernorm'.
-            norm_method: specifies whether to apply normalization before or after attention ('pre-norm' or 'post-norm'). Default is 'pre-norm'.
+            norm_method: specifies whether to apply normalization before or after attention (e.g., 'pre-norm', 'post-norm', etc.). Default is 'pre-norm'.
         dropout_rate : float
             dropout rate.
         bias : bool, optional
@@ -68,19 +69,33 @@ class EncoderBlock(nn.Module):
         self.ff_block = FeedForwardBlock(self.d_model, dff=self.dff, activation=self.activation, use_bias=self.bias)
 
 
-    def forward(self, x, need_weights=False):
+    def forward(self, x, need_weights=False, need_intermediate=False):
+
+        intermediate_outputs = dict() if need_intermediate else None
 
         # self-attention + residual + norm
-        x = self.residual_stream_block_attn(x, self._compute_self_attn, need_weights=need_weights)
+        x = self.residual_stream_block_attn(x, partial(self._compute_self_attn, intermediate_outputs=intermediate_outputs), need_weights=need_weights)
 
         # feed-forward + residual + norm
         x = self.residual_stream_block_ff(x, self._apply_ff_block)
 
+        if need_intermediate:
+            return x, intermediate_outputs
+
         return x
 
-    def _compute_self_attn(self, x, need_weights=False):
-        x, _ = self.self_attn(query=x, key=x, value=x, is_causal=self.causal,
+    def _compute_self_attn(self, x, need_weights=False, intermediate_outputs=None):
+
+        # if intermediate_outputs is not None, store attention scores
+        if intermediate_outputs is not None:
+            need_weights = True
+
+        x, attn_scores = self.self_attn(query=x, key=x, value=x, is_causal=self.causal,
             need_weights=need_weights)
+
+        if intermediate_outputs is not None:
+            intermediate_outputs['self_attn_scores'] = attn_scores
+
         x = self.dropout(x)
         return x
 
@@ -167,28 +182,48 @@ class DecoderBlock(nn.Module):
         self.residual_stream_block_ff = ResidualStreamBlock(self.d_model, norm_config=self.norm_config)
         self.ff_block = FeedForwardBlock(self.d_model, dff=self.dff, activation=self.activation, use_bias=self.bias)
 
-    def forward(self, x, context):
+    def forward(self, x, context, need_intermediate=False):
+
+        intermediate_outputs = dict() if need_intermediate else None
 
         # self-attention + residual + norm
-        x = self.residual_stream_block_selfattn(x, self._compute_self_attn)
+        x = self.residual_stream_block_selfattn(x, partial(self._compute_self_attn, intermediate_outputs=intermediate_outputs))
 
         # cross-attention + residual + norm
-        x = self.residual_stream_block_crossattn(x, self._compute_cross_attn, context=context)
+        x = self.residual_stream_block_crossattn(x, partial(self._compute_cross_attn, intermediate_outputs=intermediate_outputs), context=context)
 
         # feed-forward + residual + norm
         x = self.residual_stream_block_ff(x, self._apply_ff_block)
 
+        if need_intermediate:
+            return x, intermediate_outputs
+
         return x
 
-    def _compute_self_attn(self, x, need_weights=False):
-        x, _ = self.self_attn(query=x, key=x, value=x,
+    def _compute_self_attn(self, x, need_weights=False, intermediate_outputs=None):
+        # if intermediate_outputs is not None, store attention scores
+        if intermediate_outputs is not None:
+            need_weights = True
+
+        x, attn_scores = self.self_attn(query=x, key=x, value=x,
             is_causal=self.causal, need_weights=need_weights)
+
+        if intermediate_outputs is not None:
+            intermediate_outputs['self_attn_scores'] = attn_scores
+
         x = self.dropout(x)
         return x
 
-    def _compute_cross_attn(self, x, context, need_weights=False):
-        x, _ = self.cross_attn(query=x, key=context, value=context,
+    def _compute_cross_attn(self, x, context, need_weights=False, intermediate_outputs=None):
+        # if intermediate_outputs is not None, store attention scores
+        if intermediate_outputs is not None:
+            need_weights = True
+
+        x, attn_scores = self.cross_attn(query=x, key=context, value=context,
             is_causal=False, need_weights=need_weights)
+
+        if intermediate_outputs is not None:
+            intermediate_outputs['cross_attn_scores'] = attn_scores
 
         x = self.dropout(x)
         return x
