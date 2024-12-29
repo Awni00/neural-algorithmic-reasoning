@@ -13,6 +13,8 @@ class AttributeDict(Dict):
     """
     A drop-in replacement for a Python dictionary, with the additional functionality to access and modify keys
     through attribute lookup for convenience.
+
+    Based on a class in the pytorch lightning utilities subpackage
     """
 
     def __init__(self, *args, **kwargs):
@@ -121,48 +123,50 @@ def Sequential(*modules):
 
 # region Training utilities, e.g., learning rate scheduling, etc.
 
-def get_cosine_schedule_with_warmup(
-    optimizer: torch.optim.Optimizer,
-    num_warmup_steps: int,
-    num_training_steps: int,
-    num_cycles: float = 0.5,
-    last_epoch: int = -1,
-) -> LambdaLR:
+def get_cosine_schedule_with_warmup(optimizer, max_lr, lr_decay_steps, warmup_iters=None, min_lr=None):
     """
-    Create a learning rate schedule that linearly increases the learning rate from
-    0.0 to lr over ``num_warmup_steps``, then decreases to 0.0 on a cosine schedule over
-    the remaining ``num_training_steps-num_warmup_steps`` (assuming ``num_cycles`` = 0.5).
+    Returns a learning rate schedule that increases linearly to max_lr in the first warmup_steps,
+    then decays via a cosine curve back down to min_lr by lr_decay_steps (then stays constant).
 
-    Source: https://github.com/pytorch/torchtune/blob/32e265d5749fd592711a03247486eafa6c898d94/torchtune/training/lr_schedulers.py#L15
-    This is based on the Hugging Face implementation
-    https://github.com/huggingface/transformers/blob/v4.23.1/src/transformers/optimization.py#L104.
+    Parameters
+    ----------
+    optimizer : torch.optim.Optimizer
+        The optimizer for which to schedule the learning rate.
+    min_lr : float
+        The minimum learning rate. Default is 0.
+    max_lr : float
+        The maximum learning rate.
+    warmup_steps : int
+        The number of steps to increase the learning rate linearly in first phase. If None, defaults to 0.05 * lr_decay_steps.
+    lr_decay_steps : int
+        The total number of steps.
 
-    Args:
-        optimizer (torch.optim.Optimizer): The optimizer for which to
-            schedule the learning rate.
-        num_warmup_steps (int): The number of steps for the warmup phase.
-        num_training_steps (int): The total number of training steps.
-        num_cycles (float): The number of waves in the cosine schedule. Defaults to 0.5
-            (decrease from the max value to 0 following a half-cosine).
-        last_epoch (int): The index of the last epoch when resuming training. Defaults to -1
-
-    Returns:
-        torch.optim.lr_scheduler.LambdaLR with the appropriate schedule.
+    Returns
+    -------
+    scheduler : torch.optim.lr_scheduler.LambdaLR
+        The learning rate scheduler.
     """
 
-    def lr_lambda(current_step: int) -> float:
-        # linear warmup phase
-        if current_step < num_warmup_steps:
-            return current_step / max(1, num_warmup_steps)
+    warmup_iters = warmup_iters if warmup_iters is not None else int(lr_decay_steps * 0.05)
+    min_lr = min_lr if min_lr is not None else max_lr * 0.01
 
-        # cosine
-        progress = (current_step - num_warmup_steps) / max(
-            1, num_training_steps - num_warmup_steps
-        )
+    # NOTE: pytorch schedulers scale the optimizer's lr by the value returned,
+    # so we need to return ratio between desired lr at given step and the optimizer's lr param
+    def lr_lambda(it):
 
-        cosine_lr_multiple = 0.5 * (
-            1.0 + math.cos(math.pi * num_cycles * 2.0 * progress)
-        )
-        return max(0.0, cosine_lr_multiple)
+        # 1) linear warmup for warmup_iters steps
+        if it < warmup_iters:
+            return (it + 1) / (warmup_iters + 1)
 
-    return LambdaLR(optimizer, lr_lambda, last_epoch)
+        # 2) if it > lr_decay_iters, return min learning rate
+        if it > lr_decay_steps:
+            return min_lr / max_lr
+
+        # 3) in between, use cosine decay down to min learning rate
+        decay_ratio = (it - warmup_iters) / (lr_decay_steps - warmup_iters)
+        assert 0 <= decay_ratio <= 1
+        coeff = 0.5 * (1.0 + math.cos(math.pi * decay_ratio)) # coeff ranges 0..1
+
+        return (min_lr + coeff * (max_lr - min_lr)) / max_lr
+
+    return LambdaLR(optimizer, lr_lambda)
