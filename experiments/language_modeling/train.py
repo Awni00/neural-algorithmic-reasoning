@@ -118,12 +118,16 @@ train_loader = DataLoader(train_data, batch_size=train_config.micro_batch_size, 
 val_loader = DataLoader(val_data, batch_size=train_config.micro_batch_size, shuffle=False, num_workers=4, pin_memory=True)
 
 if train_config.log_every_n_steps is None:
-    train_config.log_every_n_steps = max(train_config.gradient_accumulation_steps, 1)
+    train_config.log_every_n_steps = 1 # max(train_config.gradient_accumulation_steps, 1) # FIXME
 
 # dynamically choose micro batch size, gradient accumulation steps, number of training steps, etc...
 
 n_train_microsteps = len(train_loader)
-train_config.n_train_steps = n_train_microsteps # used by the learning rate scheduler
+train_config.n_train_microsteps = n_train_microsteps # used by the learning rate scheduler
+train_config.n_train_steps = n_train_microsteps // train_config.gradient_accumulation_steps
+
+if train_config.get('limit_train_batches', None) is not None:
+    train_config.n_train_steps = min(train_config.n_train_steps, train_config.limit_train_batches)
 
 print('='*80)
 print(f'Total # of Training Tokens: {format_large_number(train_data.num_tokens)}')
@@ -131,7 +135,7 @@ print(f'Tokens per batch: {train_config.tokens_per_batch:,}')
 print(f'Batch size: {train_config.batch_size}')
 print(f'Micro batch size: {train_config.micro_batch_size}')
 print(f'Gradient accumulation steps: {train_config.gradient_accumulation_steps}')
-print(f'Total # of Training Steps: {n_train_microsteps // train_config.gradient_accumulation_steps} steps; {n_train_microsteps} microsteps')
+print(f'Total # of Training Steps: {train_config.n_train_steps:,} steps; {train_config.n_train_microsteps:,} microsteps')
 print('='*80)
 
 # model
