@@ -34,8 +34,9 @@ class LitTransformerLM(pl.LightningModule):
 
         loss = self.criterion(logits.view(-1, logits.size(-1)), y.contiguous().view(-1))
 
-        self.log('train/loss', loss, on_step=True, on_epoch=True, prog_bar=True, logger=True)
-        self.log('train/ppl', torch.exp(loss), on_step=True, on_epoch=True, prog_bar=True, logger=True)
+        self.log('train/loss', loss, on_step=True, prog_bar=True, logger=True)
+        self.log('train/ppl', torch.exp(loss), on_step=True, prog_bar=True, logger=True)
+        self.log('train/tokens', batch_idx * x.size(0) * x.size(1), on_step=True, prog_bar=True, logger=True)
         return loss
 
     def validation_step(self, batch, batch_idx):
@@ -70,7 +71,7 @@ class LitTransformerLM(pl.LightningModule):
             cosine_scheduler_config = self.train_config.cosine_scheduler_config
             scheduler = get_cosine_schedule_with_warmup(
                 optimizer=optimizer,
-                num_warmup_steps=cosine_scheduler_config.get('num_warmup_steps', self.train_config.n_train_steps // 10),
+                num_warmup_steps=cosine_scheduler_config.get('num_warmup_steps', int(self.train_config.n_train_steps * 0.05)), # warmup over first 5% of steps
                 num_training_steps=self.train_config.n_train_steps
             )
 
