@@ -218,6 +218,7 @@ class RecurrentTransformerLM(torch.nn.Module):
         - n_layers (int): Number of Transformer layers.
         - default_n_iters (int): Number of iterations to run the model (by default).
         - dff (int): Dimension of the feed-forward layer.
+        - bias (bool): Whether to use bias in the linear layers.
         - mlp_activation (str): Activation function for the feed-forward layer.
         - norm_config (dict): Configuration for normalization layers.
         - vocab_size (int): Size of the vocabulary.
@@ -235,13 +236,14 @@ class RecurrentTransformerLM(torch.nn.Module):
 
     def __init__(self, model_config):
 
-        super(TransformerLM, self).__init__()
+        super().__init__()
         self.model_config = model_config
 
         self.d_model = model_config.d_model
         self.n_heads = model_config.n_heads
         self.d_head = model_config.d_model // model_config.n_heads
         self.n_layers = model_config.n_layers
+        self.bias = model_config.bias
         self.dff = model_config.dff
         self.mlp_activation = getattr(model_config, 'mlp_activation', 'relu')
         self.norm_config = getattr(model_config, 'norm_config', None)
@@ -260,7 +262,7 @@ class RecurrentTransformerLM(torch.nn.Module):
         self.blocks = torch.nn.ModuleList([EncoderBlock(
             d_model=self.d_model, n_heads=self.n_heads, dff=self.dff, activation=self.mlp_activation, norm_config=self.norm_config,
             pos_enc_model=self.get_pos_enc_model(attn=True), # positional encoding model for attention (e.g., RoPE, T5, etc.)
-            attn_kwargs=self.attn_kwargs, causal=True)
+            attn_kwargs=self.attn_kwargs, bias=self.bias, causal=True)
             for _ in range(model_config.n_layers)])
 
         # if not using post-norm, apply layernorm before final linear layer
@@ -269,7 +271,7 @@ class RecurrentTransformerLM(torch.nn.Module):
         else:
             self.prelogits_norm = torch.nn.Identity()
 
-        self.embed_to_token_logits = torch.nn.Linear(model_config.d_model, model_config.vocab_size)
+        self.embed_to_token_logits = torch.nn.Linear(model_config.d_model, model_config.vocab_size, bias=self.bias)
 
         # weight tying between token_embedder and embed_to_token_logits
         if self.weight_tie_embed_to_token:
