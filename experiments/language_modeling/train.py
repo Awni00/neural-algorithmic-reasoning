@@ -217,8 +217,8 @@ trainer_kwargs = dict(
     logger=logger,
     callbacks=callbacks,
 
-    val_check_interval=getattr(train_config, 'val_check_interval', 250), # interval (in microbatches) to check validation
-    limit_val_batches=getattr(train_config, 'limit_val_batches', 20), # number of microbatches to use for validation
+    val_check_interval=getattr(train_config, 'val_check_interval', 250), # interval to check validation
+    limit_val_batches=getattr(train_config, 'limit_val_batches', 20), # number of batches to use for validation
 
     log_every_n_steps=getattr(train_config, 'log_every_n_steps', None),
 
