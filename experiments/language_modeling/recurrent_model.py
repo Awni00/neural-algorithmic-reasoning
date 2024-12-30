@@ -101,7 +101,7 @@ class LitRecurrentTransformerLM(pl.LightningModule):
 
         # randomly sample number of iterations to run model without tracking gradients
         if self.train_config.incremental_training:
-            n_nograd_iters = np.random.randint(0, self.train_config.train_max_n_iters)
+            n_nograd_iters = np.random.randint(0, self.default_n_iters)
         else:
             n_nograd_iters = 0
 
@@ -211,7 +211,13 @@ def get_experiment_name(model_config, data_config, train_config):
     # Format:
     # Group: Model Config
     # Name: Seed + Date-Time
-    model_str = f'L{model_config.n_layers}T{model_config.default_n_iters}H{model_config.n_heads}D{model_config.d_model}-{model_config.pos_enc_type}-{model_config.norm_config.norm_method}-WT{model_config.weight_tie_embed_to_token}'
+    model_str = f'L{model_config.n_layers}T{model_config.default_n_iters}H{model_config.n_heads}D{model_config.d_model}-{model_config.pos_enc_type}-{model_config.norm_config.norm_method}'
+
+    if model_config.norm_config.norm_method in ['hypersphere-spherical-interpolation', 'adaptive-hypersphere-interpolation']:
+        model_str += f'-{model_config.norm_config.single_weight}'
+
+    if model_config.weight_tie_embed_to_token:
+        model_str += '-WT'
 
     # attn_score_fn
     if model_config.attn_kwargs.attn_score_fn != 'softmax':
