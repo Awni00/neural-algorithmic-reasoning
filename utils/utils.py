@@ -60,6 +60,44 @@ class AttributeDict(Dict):
 
 # endregion
 
+# region: dictionary utilities
+
+def flatten_dict(dd, separator='.', prefix=''):
+    """flattens a nested dictionary"""
+
+    return { prefix + separator + k if prefix else k : v
+             for kk, vv in dd.items()
+             for k, v in flatten_dict(vv, separator, kk).items()
+             } if isinstance(dd, dict) else { prefix : dd }
+
+def get_unique_dict_vals(dict_list):
+    """
+    given a list of dictionaries, return a (flattened) dictionary of unique values for each key
+
+    Parameters:
+    ----------
+        dict_list (list): list of dictionaries
+
+    Returns:
+    -------
+        dict: dictionary of unique values for each key. keys are strings, values are sets
+    """
+
+    config_key_vals = dict()
+
+    for dict_ in dict_list:
+        dict_ = flatten_dict(dict_)
+
+        for key, value in dict_.items():
+            if key not in config_key_vals:
+                config_key_vals[key] = set()
+            if isinstance(value, list):
+                value = tuple(value)
+            config_key_vals[key].add(value)
+
+    return config_key_vals
+
+# endregion
 
 # region: general helpers and utilities
 
