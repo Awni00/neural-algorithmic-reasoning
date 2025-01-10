@@ -62,8 +62,8 @@ class TransformerLM(torch.nn.Module):
             attn_kwargs=self.attn_kwargs, causal=True)
             for _ in range(model_config.n_layers)])
 
-        # if not using post-norm, apply layernorm before final linear layer
-        if model_config.norm_config.norm_method != 'post-norm':
+        # if using pre-norm, apply layernorm before final linear layer
+        if model_config.norm_config.norm_method == 'pre-norm':
             self.prelogits_norm = create_norm(self.d_model, self.norm_config.get('norm_type', 'layernorm'))
         else:
             self.prelogits_norm = torch.nn.Identity()
@@ -127,7 +127,7 @@ class TransformerLM(torch.nn.Module):
         for encoder in self.blocks:
             x = encoder(x)
 
-        # apply pre-logits normalization (if not using post-norm)
+        # apply pre-logits normalization (if using pre-norm)
         x = self.prelogits_norm(x)
 
         # project to logits
@@ -265,8 +265,8 @@ class RecurrentTransformerLM(torch.nn.Module):
             attn_kwargs=self.attn_kwargs, bias=self.bias, causal=True)
             for _ in range(model_config.n_layers)])
 
-        # if not using post-norm, apply layernorm before final linear layer
-        if model_config.norm_config.norm_method != 'post-norm':
+        # if using pre-norm, apply layernorm before final linear layer
+        if model_config.norm_config.norm_method == 'pre-norm':
             self.prelogits_norm = create_norm(self.d_model, self.norm_config.get('norm_type', 'layernorm'))
         else:
             self.prelogits_norm = torch.nn.Identity()
@@ -333,13 +333,77 @@ class RecurrentTransformerLM(torch.nn.Module):
             for encoder in self.blocks:
                 x = encoder(x)
 
-        # apply pre-logits normalization (if not using post-norm)
+        # apply pre-logits normalization (if using pre-norm)
         x = self.prelogits_norm(x)
 
         # project to logits
         logits = self.embed_to_token_logits(x)
 
         return logits
+
+    def forward_skip_embed(self, x, n_iters=None):
+        """
+        forward call that skips the embedding layer (and adding positional embedding if applicable)
+
+        Parameters
+        ----------
+        x : Tensor
+            input tensor of shape (batch_size, seq_len, d_model)
+
+        Returns
+        -------
+        Tensor
+            logits tensor of shape (batch_size, seq_len, out_vocab_size)
+        """
+
+        n_iters = self.default_n_iters if n_iters is None else n_iters
+
+        # apply the Transformer layers
+        for iter in range(n_iters):
+            for encoder in self.blocks:
+                x = encoder(x)
+
+        # apply pre-logits normalization (if using pre-norm)
+        x = self.prelogits_norm(x)
+
+        # project to logits
+        logits = self.embed_to_token_logits(x)
+
+        return logits
+
+    def forward_skip_output(self, x, n_iters=None):
+        """
+
+        Forward call that skips the output layer (i.e., norm + logits)
+
+        Parameters
+        ----------
+        x : Tensor[int]
+            input tensor of token idxs of shape (batch_size, seq_len,)
+        n_iters : int, optional
+            number of iterations to run recurrent model, by default None
+
+        Returns
+        -------
+        Tensor
+            tensor of shape (batch_size, seq_len, d_model) with model output
+        """
+
+        n_iters = self.default_n_iters if n_iters is None else n_iters
+
+        # embed tokens
+        x = self.token_embedder(x)
+
+        # if positional encoding model is additive-embedding-based, add it to the input
+        if any(isinstance(self.pos_enc_model, model) for model in [ScaledSinusoidalEmbedding, AbsolutePositionalEmbedding]):
+            x += self.pos_enc_model(x)
+
+        # apply the Transformer layers
+        for iter in range(n_iters):
+            for encoder in self.blocks:
+                x = encoder(x)
+
+        return x
 
     def estimate_mfu(self, fwdbwd_per_iter, dt):
         """ estimate model flops utilization (MFU) in units of A100 bfloat16 peak FLOPS """
