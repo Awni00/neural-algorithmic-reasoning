@@ -52,7 +52,7 @@ class EncoderBlock(nn.Module):
         self.dff = dff
         self.dropout_rate = dropout_rate
         self.activation = activation
-        self.norm_config = norm_config
+        self.norm_config = dict(norm_method='pre-norm', norm_type='layernorm') | (norm_config or {})
         self.bias = bias
         self.attn_kwargs = {'n_kv_heads': None, 'add_bias_kv': False}
         if attn_kwargs is not None:
@@ -160,7 +160,7 @@ class DecoderBlock(nn.Module):
         self.dff = dff
         self.dropout_rate = dropout_rate
         self.activation = activation
-        self.norm_config = norm_config
+        self.norm_config = dict(norm_method='pre-norm', norm_type='layernorm') | (norm_config or {})
         self.bias = bias
         self.causal = causal
         self.attn_kwargs = {'n_kv_heads': None, 'add_bias_kv': False}
