@@ -561,3 +561,21 @@ class RotaryPositionalEmbeddings(nn.Module):
         # tensor has shape [b, s, n_h, h_d]
         x_out = x_out.flatten(3)
         return x_out.type_as(x)
+
+def get_pos_enc_model(pos_enc_type, pos_enc_kwargs, attn=False):
+    # attn is convenience flag which returns None if pos_enc_type is set to 'sinusoidal' or 'learned'
+
+    if pos_enc_type == 'sinusoidal' and not attn:
+        return ScaledSinusoidalEmbedding(**pos_enc_kwargs) # required: dim=d_model
+    elif pos_enc_type == 'learned' and not attn:
+        return AbsolutePositionalEmbedding(**pos_enc_kwargs) # required: dim=d_model
+    elif pos_enc_type == 'alibi':
+        return AlibiPositionalBias(**pos_enc_kwargs) # required: n_heads; can specify slopes in pos_enc_kwargs
+    elif pos_enc_type == 't5':
+        return T5RelativePositionBias(**pos_enc_kwargs) # required: n_heads; can specify num_buckets, max_distance in pos_enc_kwargs (default 32, 128)
+    elif pos_enc_type == 'rotary':
+        return RotaryPositionalEmbeddings(**pos_enc_kwargs) # required: dim=dim_head
+    elif pos_enc_type == 'none' or ((pos_enc_type in ['sinusoidal', 'learned']) and attn):
+        return None
+    else:
+        raise ValueError(f"pos_enc_type {pos_enc_type} not recognized")
