@@ -106,23 +106,23 @@ class PonderNetworkWrapper(nn.Module):
         return halting_probs
 
 
-    def forward(self, x, labels=None):
+    def forward(self, x, labels=None, **kwargs):
 
         if self.training:
             assert labels is not None, "Labels must be provided during training."
-            return self.forward_train(x, labels)
+            return self.forward_train(x, labels, **kwargs)
         else:
-            return self.forward_inference(x)
+            return self.forward_inference(x, **kwargs)
 
 
-    def forward_train(self, x, labels):
+    def forward_train(self, x, labels, **kwargs):
 
         hidden_states = []
         halting_logits = []
 
         # run network for train_max_steps pondering steps, predicting halting probabilities at each step
         for _ in range(self.train_max_steps):
-            x, halt_logits = self.ponder_block(x)
+            x, halt_logits = self.ponder_block(x, **kwargs)
 
             hidden_states.append(x)
             halting_logits.append(halt_logits)
@@ -232,7 +232,7 @@ class PonderNetworkWrapper(nn.Module):
         return kl_div_loss
 
 
-    def forward_inference(self, x):
+    def forward_inference(self, x, **kwargs):
         """
         Run the network in inference mode, halting stochastically based on predicted halting probabilities.
 
@@ -345,10 +345,10 @@ class PonderBlockWrapper(nn.Module):
             Rearrange('... () -> ...') # [B, T, 1] -> [B, T] (if halt_sequencewise=True, [B, 1] -> [B])
             )
 
-    def forward(self, x):
+    def forward(self, x, **kwargs):
         # x: [B, T, D]
 
-        y = self.block(x) # shape: [B, T, D]
+        y = self.block(x, **kwargs) # shape: [B, T, D]
 
         if self.halt_sequencewise:
             halt_input = y.mean(dim=1) # [B, T, D] -> [B, D]
