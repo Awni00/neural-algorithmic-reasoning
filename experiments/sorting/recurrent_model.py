@@ -15,9 +15,11 @@ from models.transformer_blocks import EncoderBlock
 from models.positional_encoding import ScaledSinusoidalEmbedding, AbsolutePositionalEmbedding, AlibiPositionalBias, T5RelativePositionBias, RotaryPositionalEmbeddings
 from models.residual_stream import ConcatCombine, create_norm
 from models.attention_utils import topk_softmax
+from utils.utils import get_cosine_schedule_with_warmup
 
 # model_config: temparature annealing (TODO)
 # model_config: intermediate_compute_vocab (TODO) [additional vocab for intermediate states] [how to interact with weight-tying??]
+# TODO: add more tracking of intermediate results (e.g., entropy of attention scores)
 class RecurrentTransformerModel(torch.nn.Module):
     """
     Recurrent Transformer Model.
@@ -466,16 +468,14 @@ class LitRecurrentModel(pl.LightningModule):
         # Configure the learning rate scheduler.
         if self.train_config.lr_scheduler == "cosine":
             cosine_scheduler_config = self.train_config.cosine_scheduler_config
-            # scheduler = CosineAnnealingWarmup(
-            #     optimizer=optimizer,
-            #     warmup_steps=cosine_scheduler_config.warmup_steps,
-            #     learning_rate=self.train_config.learning_rate,
-            #     min_lr=cosine_scheduler_config.min_lr,
-            #     lr_decay_steps=cosine_scheduler_config.lr_decay_steps,
-            # )
-            raise NotImplementedError("CosineAnnealingWarmup is not implemented yet!")
-        # TODO: find implementation of CosineAnnealing with Linear Warmup, or implement and add to utils module
-        # e.g. look at torch tune's https://github.com/pytorch/torchtune/blob/32e265d5749fd592711a03247486eafa6c898d94/torchtune/training/lr_schedulers.py#L15
+            scheduler = get_cosine_schedule_with_warmup(
+                optimizer=optimizer,
+                max_lr=self.train_config[f'{optimizer_name}_optimizer_config']['lr'],
+                min_lr=cosine_scheduler_config.get('min_lr', self.train_config.lr * 0.01),
+                lr_decay_steps=cosine_scheduler_config.get('lr_decay_steps', self.train_config.n_train_steps),
+                warmup_iters=cosine_scheduler_config.get('warmup_steps', None),
+            )
+
         elif self.train_config.lr_scheduler == "step":
             StepLR_config = self.train_config.StepLR_scheduler_config
             scheduler = torch.optim.lr_scheduler.StepLR(
