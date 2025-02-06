@@ -63,6 +63,13 @@ class LitRecurrentModel(pl.LightningModule):
         self.data_config = data_config
         self.train_config = train_config
 
+        print('Compile model: ', self.train_config.get('compile', False))
+        if self.train_config.get('compile', False):
+            self.model = torch.compile(self.model)
+
+        print('Use AMP:', train_config.get('amp', False))
+        self.ctx_manager = torch.amp.autocast(enabled=(train_config.get('amp', False)), dtype=torch.bfloat16, device_type='cuda')
+
         self.save_hyperparameters() # save model hyperparameters
 
         if train_config.compile:
@@ -112,10 +119,11 @@ class LitRecurrentModel(pl.LightningModule):
         # then run model with tracking gradients for n_iters
         if self.train_config.incremental_training and n_nograd_iters > 0:
             orig_input = x
-            with torch.no_grad():
+            with torch.no_grad(), self.ctx_manager:
                 x = self.model.forward_skip_output(x, n_iters=n_nograd_iters)
 
-            logits = self.model.forward_skip_embed(x, orig_input, n_iters=n_iters)
+            with self.ctx_manager:
+                logits = self.model.forward_skip_embed(x, orig_input, n_iters=n_iters)
 
         # run model with tracking gradients for random number n_iters of iters
         else:
@@ -328,32 +336,38 @@ class LitRecurrentModel(pl.LightningModule):
         # n_iters vs sequence_acc, color = test_split
         fig = px.line(test_df, x='n_iters', y='sequence_acc', color='test_split', title='Sequence Accuracy', labels={'sequence_acc': 'Sequence Accuracy', 'n_iters': 'n_iters'})
         fig.add_vline(x=self.train_config.train_max_n_iters, line_dash='dash', line_color='black', annotation_text='train_max_n_iters', annotation_position='top right')
+        fig.show()
         wandb.log({'test/sequence_acc': wandb.Plotly(fig)})
 
         # n_iters vs per_token_acc, color = test_split
         fig = px.line(test_df, x='n_iters', y='per_token_acc', color='test_split', title='Token-wise Accuracy', labels={'per_token_acc': 'Token-wise Accuracy', 'n_iters': 'n_iters'})
         fig.add_vline(x=self.train_config.train_max_n_iters, line_dash='dash', line_color='black', annotation_text='train_max_n_iters', annotation_position='top right')
+        fig.show()
         wandb.log({'test/per_token_acc': wandb.Plotly(fig)})
 
         # n_iters vs constraint_acc, color = test_split
         fig = px.line(test_df, x='n_iters', y='constraint_acc', color='test_split', title='Constraint Satisfaction Accuracy', labels={'constraint_acc': 'Constraint Satisfaction Accuracy', 'n_iters': 'n_iters'})
         fig.add_vline(x=self.train_config.train_max_n_iters, line_dash='dash', line_color='black', annotation_text='train_max_n_iters', annotation_position='top right')
+        fig.show()
         wandb.log({'test/constraint_acc': wandb.Plotly(fig)})
 
         # n_iters vs delta_norms, color = test_split
         fig = px.line(test_df, x='n_iters', y='delta_norms', color='test_split', title='Delta Norms', labels={'delta_norms': 'Delta Norms', 'n_iters': 'n_iters'})
         fig.add_vline(x=self.train_config.train_max_n_iters, line_dash='dash', line_color='black', annotation_text='train_max_n_iters', annotation_position='top right')
+        fig.show()
         wandb.log({'test/delta_norms': wandb.Plotly(fig)})
 
         # n_iters vs avg_emb_norms, color = test_split
         fig = px.line(test_df, x='n_iters', y='emb_norms', color='test_split', title='Average Embedding Norms', labels={'avg_emb_norms': 'Average Embedding Norms', 'n_iters': 'n_iters'})
         fig.add_vline(x=self.train_config.train_max_n_iters, line_dash='dash', line_color='black', annotation_text='train_max_n_iters', annotation_position='top right')
+        fig.show()
         wandb.log({'test/avg_emb_norms': wandb.Plotly(fig)})
 
         if self.model.discrete_intermediate:
             # n_iters vs disc_logits_softmax_entropy, color = test_split
             fig = px.line(test_df, x='n_iters', y='disc_logits_softmax_entropy', color='test_split', title='Discrete Logits Softmax Entropy', labels={'disc_logits_softmax_entropy': 'Discrete Logits Softmax Entropy', 'n_iters': 'n_iters'})
             fig.add_vline(x=self.train_config.train_max_n_iters, line_dash='dash', line_color='black', annotation_text='train_max_n_iters', annotation_position='top right')
+            fig.show()
             wandb.log({'test/disc_logits_softmax_entropy': wandb.Plotly(fig)})
 
 
@@ -365,6 +379,8 @@ def get_experiment_name(model_config, data_config, train_config):
     data_str = ''
     # model_str = f'L{model_config.n_layers}H{model_config.n_heads}D{model_config.d_model}_{model_config.pos_enc_type}_IR{model_config.input_recall}_WT{model_config.weight_tie_embed_to_token}-{model_config.weight_tie_discrete_interm}'
     model_str = f'L{model_config.n_layers}T{model_config.default_n_iters}H{model_config.n_heads}D{model_config.d_model}_IR{model_config.input_recall}'
+    if model_config.get('norm_method', None) is not None:
+        model_str += f'_norm-{model_config.norm_method}'
     if model_config.intermediate_discretization.get('weight_tie_method', None) is not None:
         model_str += f'_WT{model_config.intermediate_discretization.weight_tie_method}'
 
