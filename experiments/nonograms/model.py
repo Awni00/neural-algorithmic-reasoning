@@ -97,7 +97,13 @@ class RecurrentTransformerModel(torch.nn.Module):
             self.discretization_map = get_discretization_map(self.discretization_map_type, self.discretization_map_params)
 
             # used for mapping embedded state to discretization logits space (optionally tied with final linear layer)
-            self.emb_to_disc_logits = torch.nn.Linear(self.d_model, self.intermediate_vocab_size)
+            emb_to_disc_logits_linear = torch.nn.Linear(self.d_model, self.intermediate_vocab_size)
+            emb_to_disc_prelogits_norm = create_norm(self.d_model, self.norm_config.get('norm_type', 'layernorm')) if self.norm_config['norm_method'] == 'pre-norm' else torch.nn.Identity()
+            self.emb_to_disc_logits = torch.nn.Sequential(
+                emb_to_disc_prelogits_norm,
+                emb_to_disc_logits_linear
+            )
+            # TODO: need pre-norm for this layer? (if using pre-norm, should apply normalization before this layer)
 
             # used for mapping discrete intermediate state to embedded state (optionally tied with embedding matrix)
             self.disc_to_embed = torch.nn.Linear(self.intermediate_vocab_size, self.d_model)
@@ -136,11 +142,12 @@ class RecurrentTransformerModel(torch.nn.Module):
         if self.discrete_intermediate:
             # note: we don't weight-tie constraint_embedder, since it has a different vocab in the nonograms task
 
-            if self.weight_tie_method == 'None':
+            if self.weight_tie_method == 'none':
                 pass
             elif self.weight_tie_method == 'to_logits':
-                # weight tie linear map but not bias (allow for different biases in intermediate vs final logits)
-                self.emb_to_disc_logits.weight = to_logits_linear.weight
+                self.embed_to_token_logits[0] = self.emb_to_disc_logits[0]
+                self.embed_to_token_logits[1] = self.emb_to_disc_logits[1]
+                # note: if number of discrete intermediate states is larger, this will increase the number of classes in the final layer (some of which will be unused)
             elif self.weight_tie_method == 'disc-in-out':
                 self.emb_to_disc_logits.weight = torch.nn.Parameter(self.disc_to_embed.weight.t())
             elif self.weight_tie_method == 'all':
