@@ -7,6 +7,7 @@ import pandas as pd
 import plotly.express as px
 
 from model import RecurrentTransformerModel
+from system2_model import RecurrentSystem2TransformerModel
 from data_utils import calc_constraint_accuracy
 
 from utils.utils import get_cosine_schedule_with_warmup
@@ -58,10 +59,19 @@ class LitRecurrentModel(pl.LightningModule):
 
     def __init__(self, model_config, data_config, train_config):
         super().__init__()
-        self.model = RecurrentTransformerModel(model_config)
         self.model_config = model_config
         self.data_config = data_config
         self.train_config = train_config
+
+        if model_config.model_type == 'RecurrentTransformer':
+            self.model = RecurrentTransformerModel(model_config)
+        elif model_config.model_type == 'RecurrentSystem2Transformer':
+            self.model = RecurrentSystem2TransformerModel(model_config)
+        else:
+            raise ValueError(f"Model type {model_config.model_type} not implemented!")
+
+        # if using delta state regularization or tracking delta state KL loss, set flag
+        self.need_delta_state_reg = self.model_config.delta_state_regularization.enable or self.model_config.delta_state_regularization.get('track', False)
 
         print('Compile model: ', self.train_config.get('compile', False))
         if self.train_config.get('compile', False):
@@ -104,6 +114,59 @@ class LitRecurrentModel(pl.LightningModule):
 
         return n_iters, n_nograd_iters
 
+    def compute_regularization_loss(self, intermediate_states, log_prefix=None):
+        lamda = self.model_config.delta_state_regularization.lamda
+
+        # if using discrete intermediate states, compute KL divergence between consecutive discrete states
+        if self.model.discrete_intermediate:
+            state_logits = intermediate_states['disc_logits']
+        # otherwise, use the predicted logits from the embedding
+        else:
+            state_logits = intermediate_states['logits_states']
+
+        kl_divs = []
+
+        # compute KL divergence between consecutive state logits
+        # regularize so that not too many tokens change their states in a single step
+        for prev_logits, logits in zip(state_logits[:-1], state_logits[1:]):
+            states = torch.nn.functional.log_softmax(logits, dim=-1) # shape: [B, X, Y, interm_vocab_size]
+            target = torch.nn.functional.softmax(prev_logits, dim=-1) # shape: [B, X, Y, interm_vocab_size]
+            kl_div = torch.nn.functional.kl_div(states, target, reduction='none').mean(dim=-1) # shape: [B, X, Y]
+
+            kl_divs.append(kl_div)
+
+        # stepwise, tokenwise KL divergence: Delta_i^{t} = KL(S_i^{t+1} || S_i^{t})
+        kl_divs = torch.stack(kl_divs) # shape: (T - 1, B, X, Y)
+
+        # Delta^{t} = mean_{batch} mean_{i} Delta_i^{t}
+        stepwise_kl_div = kl_divs.mean(dim=(1,2,3)) # shape: (T - 1,)
+
+        # maximum single-step change in KL Delta: max_{t} Delta^{t}
+        max_step_kl_div = stepwise_kl_div.max() # scalar
+        reg_loss = max_step_kl_div
+
+        if log_prefix is not None:
+            self.log(f'{log_prefix}/state_change_reg_loss', reg_loss)
+
+        return lamda * reg_loss
+
+    def compute_loss(self, logits, y, intermediate_states=None, log_prefix=None):
+
+        loss = self.criterion(logits.view(-1, logits.size(-1)), y.contiguous().view(-1))
+
+        if log_prefix is not None:
+            self.log(f'{log_prefix}/loss', loss)
+
+        if self.need_delta_state_reg:
+            reg_loss = self.compute_regularization_loss(intermediate_states, log_prefix=log_prefix)
+            if self.model_config.delta_state_regularization.enable:
+                loss += reg_loss
+
+                if log_prefix is not None:
+                    self.log(f'{log_prefix}/total_loss', loss)
+
+        return loss
+
     def training_step(self, batch):
 
         x, y = batch
@@ -127,9 +190,14 @@ class LitRecurrentModel(pl.LightningModule):
 
         # run model with tracking gradients for random number n_iters of iters
         else:
-            logits = self.model(x, n_iters=n_iters)
+            if self.need_delta_state_reg:
+                with self.ctx_manager:
+                    logits, intermediate_states = self.model(x, n_iters=n_iters, return_intermediate_states=True)
+            else:
+                with self.ctx_manager:
+                    logits = self.model(x, n_iters=n_iters)
 
-        loss = self.criterion(logits.view(-1, logits.size(-1)), y.contiguous().view(-1))
+        loss = self.compute_loss(logits, y, intermediate_states, log_prefix='train')
 
         metrics = self.compute_metrics(batch, logits)
 
@@ -150,6 +218,10 @@ class LitRecurrentModel(pl.LightningModule):
         # randomly sample n_iters for validation, as in training
         n_iters, n_nograd_iters = self.sample_n_iters()
         logits, intermediate_states = self.model(x, n_iters=n_iters+n_nograd_iters, return_intermediate_states=True)
+        # TODO: add logging of compute token scores, etc. for intermediate states
+
+        # compute and log loss
+        loss = self.compute_loss(logits, y, intermediate_states, log_prefix='val')
 
         metrics = self.compute_metrics(batch, logits)
 
@@ -163,7 +235,7 @@ class LitRecurrentModel(pl.LightningModule):
         intermediate_states_metrics = self.compute_intermediate_state_metrics(intermediate_states)
         self.log_metrics(intermediate_states_metrics, key_dir='val_interm', prog_bar=False)
 
-        return metrics['loss']
+        return loss
 
     def test_step(self, batch, batch_idx=0, dataloader_idx=0):
 
@@ -176,6 +248,10 @@ class LitRecurrentModel(pl.LightningModule):
         # first, run model for max number of iterations, tracking intermediate states (to log entropy of logits, embedding norms, etc.)
         logits, intermediate_states = self.model(x, n_iters=self.train_config.test_max_n_iters, return_intermediate_states=True)
         # intermediate_states: Dict[str, List[torch.Tensor]] with keys: disc_interm_states, logits_states, emb_norms. List length = n_iters
+
+        # compute and log loss
+        loss = self.compute_loss(logits, y, intermediate_states, log_prefix='test')
+
         assert len(intermediate_states['emb_norms']) == self.train_config.test_max_n_iters, f"Expected {self.train_config.test_max_n_iters} intermediate states, got {len(intermediate_states['emb_norms'])}"
         if self.model.discrete_intermediate:
             assert len(intermediate_states['disc_logits_softmax_entropy']) == self.train_config.test_max_n_iters - 1, f"Expected {self.train_config.test_max_n_iters} intermediate states, got {len(intermediate_states['disc_logits_softmax_entropy'])}"
@@ -194,15 +270,18 @@ class LitRecurrentModel(pl.LightningModule):
             # average embedding norm over batch, sequence length
             metrics['emb_norms'] = intermediate_states['emb_norms'][n_iters - 1].mean()
             metrics['delta_norms'] = intermediate_states['delta_norms'][n_iters - 1].mean()
+            if self.model_config.model_type == 'RecurrentSystem2Transformer':
+                metrics['compute_token_scores_entropy'] = intermediate_states['compute_token_scores_entropy'][n_iters - 1].mean()
+                metrics['candidate_norms'] = intermediate_states['candidate_norms'][n_iters - 1].mean()
+                metrics['token_update_norms'] = intermediate_states['token_update_norms'][n_iters - 1].mean()
+                metrics['normalized_token_update_norms'] = intermediate_states['normalized_token_update_norms'][n_iters - 1].mean()
             if self.model.discrete_intermediate and not last_iter:
                 # average entropy of discrete state logits over batch, sequence length
                 metrics['disc_logits_softmax_entropy'] = intermediate_states['disc_logits_softmax_entropy'][n_iters - 1].mean()
 
             self.test_step_outputs.append(dict(test_split=test_split_name, n_iters=n_iters, metrics=metrics))
 
-        # self.log_metrics(metrics, key_dir='test', prefix=f'L={ood_length}', add_dataloader_idx=False)
-
-        return metrics['loss']
+        return loss
 
     def on_test_epoch_end(self):
 
@@ -224,18 +303,15 @@ class LitRecurrentModel(pl.LightningModule):
 
         self.test_step_outputs.clear()  # free memory
 
-
-
     def compute_metrics(self, batch, logits):
         x, y = batch
-        loss = self.criterion(logits.view(-1, logits.size(-1)), y.contiguous().view(-1))
 
         # compute accuracy
         _, predicted = torch.max(logits, -1)
         per_token_acc = (predicted == y).float().mean()
         sequence_acc = (predicted == y).all(dim=(1, 2)).float().mean()
 
-        metrics = dict(loss=loss, per_token_acc=per_token_acc, sequence_acc=sequence_acc)
+        metrics = dict(per_token_acc=per_token_acc, sequence_acc=sequence_acc)
 
         return metrics
 
@@ -248,13 +324,15 @@ class LitRecurrentModel(pl.LightningModule):
 
         intermediate_states_metrics = dict()
         # compute avg entropy over batch, sequence length
-        intermediate_states_metrics['avg_emb_norms'] = calc_metrics_mean(intermediate_states['emb_norms'])
-        intermediate_states_metrics['avg_delta_norms'] = calc_metrics_mean(intermediate_states['delta_norms'])
+        metrics = ['emb_norms', 'delta_norms']
         if self.model.discrete_intermediate:
-            intermediate_states_metrics['avg_disc_logits_softmax_entropy'] = calc_metrics_mean(intermediate_states['disc_logits_softmax_entropy'])
+            metrics += ['disc_logits_softmax_entropy']
+        if self.model_config.model_type == 'RecurrentSystem2Transformer':
+            metrics += ['compute_token_scores_entropy', 'candidate_norms', 'token_update_norms', 'normalized_token_update_norms']
+        for metric in metrics:
+            intermediate_states_metrics[f'avg_{metric}'] = calc_metrics_mean(intermediate_states[metric])
 
         return intermediate_states_metrics
-
 
     def log_metrics(self, metrics, prefix=None, key_dir=None, **log_kwargs):
         for key, value in metrics.items():
@@ -370,6 +448,30 @@ class LitRecurrentModel(pl.LightningModule):
             fig.show()
             wandb.log({'test/disc_logits_softmax_entropy': wandb.Plotly(fig)})
 
+        if self.model_config.model_type == 'RecurrentSystem2Transformer':
+            # n_iters vs avg_compute_token_scores_entropy, color = test_split
+            fig = px.line(test_df, x='n_iters', y='compute_token_scores_entropy', color='test_split', title='Compute Token Scores Entropy', labels={'avg_compute_token_scores_entropy': 'Compute Token Scores Entropy', 'n_iters': 'n_iters'})
+            fig.add_vline(x=self.train_config.train_max_n_iters, line_dash='dash', line_color='black', annotation_text='train_max_n_iters', annotation_position='top right')
+            fig.show()
+            wandb.log({'test/compute_token_scores_entropy': wandb.Plotly(fig)})
+
+            # n_iters vs avg_candidate_norms, color = test_split
+            fig = px.line(test_df, x='n_iters', y='candidate_norms', color='test_split', title='Candidate Norms', labels={'avg_candidate_norms': 'Candidate Norms', 'n_iters': 'n_iters'})
+            fig.add_vline(x=self.train_config.train_max_n_iters, line_dash='dash', line_color='black', annotation_text='train_max_n_iters', annotation_position='top right')
+            fig.show()
+            wandb.log({'test/candidate_norms': wandb.Plotly(fig)})
+
+            # n_iters vs avg_token_update_norms, color = test_split
+            fig = px.line(test_df, x='n_iters', y='token_update_norms', color='test_split', title='Token Update Norms', labels={'avg_token_update_norms': 'Token Update Norms', 'n_iters': 'n_iters'})
+            fig.add_vline(x=self.train_config.train_max_n_iters, line_dash='dash', line_color='black', annotation_text='train_max_n_iters', annotation_position='top right')
+            fig.show()
+            wandb.log({'test/token_update_norms': wandb.Plotly(fig)})
+
+            # n_iters vs avg_normalized_token_update_norms, color = test_split
+            fig = px.line(test_df, x='n_iters', y='normalized_token_update_norms', color='test_split', title='Normalized Token Update Norms', labels={'normalized_token_update_norms': 'Normalized Token Update Norms', 'n_iters': 'n_iters'})
+            fig.add_vline(x=self.train_config.train_max_n_iters, line_dash='dash', line_color='black', annotation_text='train_max_n_iters', annotation_position='top right')
+            fig.show()
+            wandb.log({'test/normalized_token_update_norms': wandb.Plotly(fig)})
 
 from datetime import datetime
 def get_experiment_name(model_config, data_config, train_config):
@@ -378,11 +480,15 @@ def get_experiment_name(model_config, data_config, train_config):
     # Name: Seed + Date-Time
     data_str = ''
     # model_str = f'L{model_config.n_layers}H{model_config.n_heads}D{model_config.d_model}_{model_config.pos_enc_type}_IR{model_config.input_recall}_WT{model_config.weight_tie_embed_to_token}-{model_config.weight_tie_discrete_interm}'
-    model_str = f'L{model_config.n_layers}T{model_config.default_n_iters}H{model_config.n_heads}D{model_config.d_model}_IR{model_config.input_recall}'
+    model_str = f'{model_config.model_type}-L{model_config.n_layers}T{model_config.default_n_iters}H{model_config.n_heads}D{model_config.d_model}_IR{model_config.input_recall}'
+    if model_config.model_type == 'RecurrentSystem2Transformer':
+        model_str += f'_CT{model_config.n_compute_tokens}'
     if model_config.get('norm_method', None) is not None:
         model_str += f'_norm-{model_config.norm_method}'
     if model_config.intermediate_discretization.get('weight_tie_method', None) is not None:
         model_str += f'_WT{model_config.intermediate_discretization.weight_tie_method}'
+    if model_config.delta_state_regularization.enable:
+        model_str += f'_DSR-{model_config.delta_state_regularization.lamda}'
 
     # attn_score_fn
     attn_score_fn = model_config.get('attn_kwargs', {}).get('attn_score_fn', None)
@@ -403,7 +509,7 @@ def get_experiment_name(model_config, data_config, train_config):
     if train_config.incremental_training:
         train_str += '_incremental'
 
-    group_name = f'{model_str} - {train_str} - {data_str}'
+    group_name = f'{model_str} - {train_str}' #  - {data_str}
 
     run_name = datetime.now().strftime("%Y-%m-%d-%H:%M:%S")
     if getattr(train_config, 'seed', None) is not None:
