@@ -103,13 +103,9 @@ class RecurrentTransformerModel(torch.nn.Module):
                 emb_to_disc_prelogits_norm,
                 emb_to_disc_logits_linear
             )
-            # TODO: need pre-norm for this layer? (if using pre-norm, should apply normalization before this layer)
 
             # used for mapping discrete intermediate state to embedded state (optionally tied with embedding matrix)
             self.disc_to_embed = torch.nn.Linear(self.intermediate_vocab_size, self.d_model)
-
-            # TODO: add support for intermediate_vocab_size > vocab_size
-            # how to do it? use max(emb_dim, vocab_size) for token_to_embed, and then project to vocab_size?
 
         assert not self.discrete_intermediate or self.discretization_map is not None, "Discretization map must be provided for discrete intermediate."
 
