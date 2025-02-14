@@ -58,6 +58,8 @@ class RecurrentTransformerModel(torch.nn.Module):
         self.n_heads = model_config.n_heads
         self.d_head = model_config.d_model // model_config.n_heads
         self.n_layers = model_config.n_layers
+        self.n_encoder_layers = model_config.get('n_encoder_layers', model_config.n_layers)
+        self.n_decoder_layers = model_config.get('n_decoder_layers', model_config.n_layers)
         self.dff = model_config.dff
         self.mlp_activation = getattr(model_config, 'mlp_activation', 'relu')
         self.norm_config = getattr(model_config, 'norm_config', None)
@@ -109,12 +111,24 @@ class RecurrentTransformerModel(torch.nn.Module):
 
         assert not self.discrete_intermediate or self.discretization_map is not None, "Discretization map must be provided for discrete intermediate."
 
+        self.encoding_blocks = torch.nn.ModuleList([EncoderBlock(
+            d_model=self.d_model, n_heads=self.n_heads, dff=self.dff, activation=self.mlp_activation, norm_config=self.norm_config,
+            pos_enc_model=None, # for now, using 2D PositionalEmbeddings (added once at beginning of forward pass) TODO: consider alternatives
+            attn_kwargs=self.attn_kwargs)
+            for _ in range(self.n_encoder_layers)])
+
         # each recurrent step involves running a sequence of Transformer blocks (incl. attention + MLP)
-        self.encoder = torch.nn.ModuleList([EncoderBlock(
+        self.recurrent_blocks = torch.nn.ModuleList([EncoderBlock(
             d_model=self.d_model, n_heads=self.n_heads, dff=self.dff, activation=self.mlp_activation, norm_config=self.norm_config,
             pos_enc_model=None, # for now, using 2D PositionalEmbeddings (added once at beginning of forward pass) TODO: consider alternatives
             attn_kwargs=self.attn_kwargs)
             for _ in range(model_config.n_layers)])
+
+        self.decoding_blocks = torch.nn.ModuleList([EncoderBlock(
+            d_model=self.d_model, n_heads=self.n_heads, dff=self.dff, activation=self.mlp_activation, norm_config=self.norm_config,
+            pos_enc_model=None, # for now, using 2D PositionalEmbeddings (added once at beginning of forward pass) TODO: consider alternatives
+            attn_kwargs=self.attn_kwargs)
+            for _ in range(model_config.n_decoder_layers)])
 
         # final linear layer to project from model dimension to vocab size
         if self.norm_config['norm_method'] == 'pre-norm':
@@ -159,75 +173,63 @@ class RecurrentTransformerModel(torch.nn.Module):
         # TODO: special initialization? e.g., GPT-2 initialization or glorot_normal_, etc.
         # by default will be glorot_uniform_ (default for torch.nn.Linear)
 
-
-    def forward(self, x, n_iters=None, return_intermediate_states=False):
+    def forward(self, inputs, n_iters=None, return_intermediate_states=False):
 
         if n_iters is None:
             n_iters = self.default_n_iters
 
-        input_emb = self.constraint_embedder(x) # shape: [batch_size, x, y, dim]
-        x = input_emb # shape: [batch_size, x, y, dim]
-        input_emb = self.grid_to_seq(input_emb) # flatten x and y dimensions for use in input recall
-
-        xy_pos_emb = self.pos_enc_model(x) # shape: [batch_size, x, y, dim]
-        x += xy_pos_emb # shape: [batch_size, x, y, dim]
-
-        # flatten x and y dimensions
-        x = self.grid_to_seq(x) # shape: [batch_size, x * y, dim]
-
         if return_intermediate_states:
-            intermediate_states = dict(logits_states=[], emb_norms=[], delta_norms=[])
-            if self.discrete_intermediate:
-                for key in ['disc_logits', 'disc_logits_softmax_entropy', 'disc_interm_states']:
-                    intermediate_states[key] = []
+            intermediate_states = self.initialize_intermediate_states()
+        else:
+            intermediate_states = None
 
+        input_encoding = self.constraint_embedder(inputs) # shape: [batch_size, x, y, dim]
+        xy_pos_emb = self.pos_enc_model(inputs) # shape: [batch_size, x, y, dim]
+        input_encoding += xy_pos_emb # shape: [batch_size, x, y, dim]
+
+        # flatten x and y dimensions for use in input recall
+        input_encoding = self.grid_to_seq(input_encoding) # shape: [batch_size, x * y, dim]
+
+        # encoder
+        input_encoding = self.compute_encoding(input_encoding) # shape: [batch_size, x * y, dim]
+
+        # initialize recurrent state
+        x = input_encoding
+
+        # recurrent blocks
         for iter in range(n_iters):
             last = iter == n_iters - 1
 
             x_prev = x
 
             if self.input_recall:
-                x = self.input_recall_combine(x, input_emb)
+                x = self.input_recall_combine(x, input_encoding)
 
-            x = self.compute_iteration(x)
+            x = self.compute_iteration(x) # update recurrent state with recurrent block
 
             if return_intermediate_states:
-                intermediate_states['delta_norms'].append((x - x_prev).norm(dim=-1))
-                intermediate_states['emb_norms'].append(x.norm(dim=-1))
-
-                iter_logits = self.embed_to_token_logits(x) # shape: [batch_size, x * y, vocab_size]
-                iter_logits = self.seq_to_grid(iter_logits) # shape: [batch_size, x, y, vocab_size]
-
-                intermediate_states['logits_states'].append(iter_logits)
+                self.add_post_iter_intermediate_states(x, x_prev, intermediate_states)
 
             if self.discrete_intermediate and not last: # don't discretize on last iteration
-                x = self.emb_to_disc_logits(x) # project to logits space (predict discrete tokens)
+                disc_logits = self.emb_to_disc_logits(x) # project to logits space (predict discrete tokens)
+
+                disc_interm_states = self.discretization_map(disc_logits)
+
+                x = self.disc_to_embed(disc_interm_states)
 
                 if return_intermediate_states:
-                    disc_logits = self.seq_to_grid(x) # shape: [batch_size, x, y, vocab_size]
-                    intermediate_states['disc_logits'].append(disc_logits)
-                    # logits_states_softmax_entropy = (-x.float().softmax(dim=-1) * x.float().softmax(dim=-1).log2()).sum(dim=-1)
-                    logits_states_softmax_entropy = torch.special.entr(disc_logits.softmax(dim=-1)).sum(dim=-1)
-                    # note: torch.speecial.entr computes -x * ln(x) elementwise
-                    intermediate_states['disc_logits_softmax_entropy'].append(logits_states_softmax_entropy)
+                    self.add_post_disc_intermediate_states(disc_logits, disc_interm_states, intermediate_states)
 
-                x = self.discretization_map(x)
-
-                if return_intermediate_states:
-                    intermediate_states['disc_interm_states'].append(self.seq_to_grid(x))
-
-                x = self.disc_to_embed(x)
+        # decoder
+        x = self.compute_decoding(x)
 
         # final predictions
         x = self.embed_to_token_logits(x)
         x = self.seq_to_grid(x)
 
-        if return_intermediate_states:
-            return x, intermediate_states
+        return x, intermediate_states
 
-        return x
-
-    def forward_skip_embed(self, x, orig_input, n_iters=1):
+    def forward_skip_encode(self, x, orig_input, n_iters=1, return_intermediate_states=False, intermediate_states=None):
         '''
         forward call that skips embedding the input pre-first iteration, and instead continues from the embeddings produced by forward_skip_output.
         used for implementing incremental training procedure.
@@ -235,32 +237,57 @@ class RecurrentTransformerModel(torch.nn.Module):
         if n_iters is None:
             n_iters = self.default_n_iters
 
-        input_emb = self.constraint_embedder(orig_input) # shape: [batch_size, x, y, dim]
-        input_emb = self.grid_to_seq(input_emb) # flatten x and y dimensions for use in input recall
+        # initialize intermediate states if not provided
+        if return_intermediate_states and intermediate_states is None:
+            intermediate_states = self.initialize_intermediate_states()
 
+        input_encoding = self.constraint_embedder(orig_input) # shape: [batch_size, x, y, dim]
+        xy_pos_emb = self.pos_enc_model(orig_input) # shape: [batch_size, x, y, dim]
+        input_encoding += xy_pos_emb # shape: [batch_size, x, y, dim]
+
+        # flatten x and y dimensions for use in input recall
+        input_encoding = self.grid_to_seq(input_encoding) # shape: [batch_size, x * y, dim]
+
+        # encoder
+        input_encoding = self.compute_encoding(input_encoding) # shape: [batch_size, x * y, dim]
+
+        # start recurrent state at given x
+
+        # recurrent blocks
         for iter in range(n_iters):
             last = iter == n_iters - 1
 
-            if self.input_recall:
-                x = self.input_recall_combine(x, input_emb)
+            x_prev = x
 
-            x = self.compute_iteration(x)
+            if self.input_recall:
+                x = self.input_recall_combine(x, input_encoding)
+
+            x = self.compute_iteration(x) # update recurrent state with recurrent block
+
+            if return_intermediate_states:
+                self.add_post_iter_intermediate_states(x, x_prev, intermediate_states)
 
             if self.discrete_intermediate and not last: # don't discretize on last iteration
-                x = self.emb_to_disc_logits(x) # project to logits space (predict discrete tokens)
+                disc_logits = self.emb_to_disc_logits(x) # project to logits space (predict discrete tokens)
 
-                x = self.discretization_map(x)
+                disc_interm_states = self.discretization_map(disc_logits)
 
-                x = self.disc_to_embed(x)
+                x = self.disc_to_embed(disc_interm_states)
+
+                if return_intermediate_states:
+                    self.add_post_disc_intermediate_states(disc_logits, disc_interm_states, intermediate_states)
+
+        # decoder
+        x = self.compute_decoding(x)
 
         # final predictions
         x = self.embed_to_token_logits(x)
         x = self.seq_to_grid(x)
 
-        return x
+        return x, intermediate_states
 
 
-    def forward_skip_output(self, x, n_iters=1):
+    def forward_skip_decode(self, inputs, n_iters=1, return_intermediate_states=False):
         '''
         forward call that skips the final output prediction, ending mid-way through.
         used for implementing incremental training procedure.
@@ -268,43 +295,100 @@ class RecurrentTransformerModel(torch.nn.Module):
 
         if n_iters is None:
             n_iters = self.default_n_iters
+        if return_intermediate_states:
+            intermediate_states = self.initialize_intermediate_states()
+        else:
+            intermediate_states = None
 
-        input_emb = self.constraint_embedder(x) # shape: [batch_size, x, y, dim]
-        x = input_emb # shape: [batch_size, x, y, dim]
-        input_emb = self.grid_to_seq(input_emb) # flatten x and y dimensions for use in input recall
 
-        xy_pos_emb = self.pos_enc_model(x) # shape: [batch_size, x, y, dim]
-        x += xy_pos_emb # shape: [batch_size, x, y, dim]
+        input_encoding = self.constraint_embedder(inputs) # shape: [batch_size, x, y, dim]
+        xy_pos_emb = self.pos_enc_model(inputs) # shape: [batch_size, x, y, dim]
+        input_encoding += xy_pos_emb # shape: [batch_size, x, y, dim]
 
-        # flatten x and y dimensions
-        x = self.grid_to_seq(x) # shape: [batch_size, x * y, dim]
+        # flatten x and y dimensions for use in input recall
+        input_encoding = self.grid_to_seq(input_encoding) # shape: [batch_size, x * y, dim]
 
+        # encoder
+        input_encoding = self.compute_encoding(input_encoding) # shape: [batch_size, x * y, dim]
+
+        # initialize recurrent state
+        x = input_encoding
+
+        # recurrent blocks
         for iter in range(n_iters):
 
-            if self.input_recall:
-                x = self.input_recall_combine(x, input_emb)
+            x_prev = x
 
-            x = self.compute_iteration(x)
+            if self.input_recall:
+                x = self.input_recall_combine(x, input_encoding)
+
+            x = self.compute_iteration(x) # update recurrent state with recurrent block
+
+            if return_intermediate_states:
+                self.add_post_iter_intermediate_states(x, x_prev, intermediate_states)
 
             # note: unlike forward, we still discretize on iter == n_iters - 1 because this is not actually the last iteration
             if self.discrete_intermediate:
-                x = self.emb_to_disc_logits(x) # project to logits space (predict discrete tokens)
+                disc_logits = self.emb_to_disc_logits(x) # project to logits space (predict discrete tokens)
+
+                disc_interm_states = self.discretization_map(disc_logits)
+
+                x = self.disc_to_embed(disc_interm_states)
+
+                if return_intermediate_states:
+                    self.add_post_disc_intermediate_states(disc_logits, disc_interm_states, intermediate_states)
 
 
-                x = self.discretization_map(x)
+        # skip final prediction and return recurrent state tensor [batch_size, x * y, dim]
 
-                x = self.disc_to_embed(x)
-
-        # skip final prediction and return [batch_size, x * y, dim] tensor
-
-        return x
+        return x, intermediate_states
 
 
     def compute_iteration(self, x):
-        for encoder in self.encoder:
+        for encoder in self.recurrent_blocks:
             x = encoder(x)
 
         return x
+
+    def compute_encoding(self, x):
+        for encoder in self.encoding_blocks:
+            x = encoder(x)
+
+        return x
+
+    def compute_decoding(self, x):
+        for encoder in self.decoding_blocks:
+            x = encoder(x)
+
+        return x
+
+    def initialize_intermediate_states(self):
+        intermediate_states = dict(logits_states=[], emb_norms=[], delta_norms=[])
+        if self.discrete_intermediate:
+            for key in ['disc_logits', 'disc_logits_softmax_entropy', 'disc_interm_states']:
+                    intermediate_states[key] = []
+        return intermediate_states
+
+    def add_post_iter_intermediate_states(self, x, x_prev, intermediate_states):
+        intermediate_states['delta_norms'].append((x - x_prev).norm(dim=-1))
+        intermediate_states['emb_norms'].append(x.norm(dim=-1))
+
+        iter_logits = self.embed_to_token_logits(x) # shape: [batch_size, x * y, vocab_size]
+        iter_logits = self.seq_to_grid(iter_logits) # shape: [batch_size, x, y, vocab_size]
+
+        intermediate_states['logits_states'].append(iter_logits)
+
+    def add_post_disc_intermediate_states(self, disc_logits, disc_interm_states, intermediate_states):
+        disc_logits = self.seq_to_grid(disc_logits) # shape: [batch_size, x, y, vocab_size]
+        # logits_states_softmax_entropy = (-x.float().softmax(dim=-1) * x.float().softmax(dim=-1).log2()).sum(dim=-1)
+        logits_states_softmax_entropy = torch.special.entr(disc_logits.softmax(dim=-1)).sum(dim=-1)
+        # note: torch.speecial.entr computes -x * ln(x) elementwise
+
+        intermediate_states['disc_logits'].append(disc_logits)
+        intermediate_states['disc_logits_softmax_entropy'].append(logits_states_softmax_entropy)
+
+        intermediate_states['disc_interm_states'].append(self.seq_to_grid(disc_interm_states))
+
 
 # helper functions
 
