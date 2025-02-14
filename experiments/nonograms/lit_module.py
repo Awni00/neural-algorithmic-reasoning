@@ -96,6 +96,8 @@ class LitRecurrentModel(pl.LightningModule):
 
     def sample_n_iters(self):
 
+        # TODO: add option for different sampling schemes (e.g., https://arxiv.org/pdf/2502.05171)
+        # e.g., log normal poisson?
         if self.train_config.progressive_training and np.random.random() < 1 - self.train_config.progressive_training_prob:
             return (self.train_config.train_max_n_iters, 0)
 
@@ -114,9 +116,7 @@ class LitRecurrentModel(pl.LightningModule):
 
         return n_iters, n_nograd_iters
 
-    def compute_regularization_loss(self, intermediate_states, log_prefix=None):
-        lamda = self.model_config.delta_state_regularization.lamda
-
+    def calc_stepwise_kl_div(self, intermediate_states):
         # if using discrete intermediate states, compute KL divergence between consecutive discrete states
         if self.model.discrete_intermediate:
             state_logits = intermediate_states['disc_logits']
@@ -135,11 +135,26 @@ class LitRecurrentModel(pl.LightningModule):
 
             kl_divs.append(kl_div)
 
+        if len(kl_divs) == 0:
+            return None
+
         # stepwise, tokenwise KL divergence: Delta_i^{t} = KL(S_i^{t+1} || S_i^{t})
         kl_divs = torch.stack(kl_divs) # shape: (T - 1, B, X, Y)
 
-        # Delta^{t} = mean_{batch} mean_{i} Delta_i^{t}
-        stepwise_kl_div = kl_divs.mean(dim=(1,2,3)) # shape: (T - 1,)
+        return kl_divs
+
+    def compute_regularization_loss(self, intermediate_states, log_prefix=None):
+        lamda = self.model_config.delta_state_regularization.lamda
+
+        # stepwise, tokenwise KL divergence: Delta_i^{t} = KL(S_i^{t+1} || S_i^{t})
+        kl_divs = self.calc_stepwise_kl_div(intermediate_states) # shape: (T - 1, B, X, Y)
+
+        if kl_divs is None:
+            return 0
+
+        # Delta^{t} = mean_{batch} sum_{i,j} Delta_{i,j}^{t}
+        stepwise_kl_div = kl_divs.sum(dim=(2,3)) # shape: (T - 1, B)
+        stepwise_kl_div = stepwise_kl_div.mean(dim=1) # shape: (T - 1,)
 
         # maximum single-step change in KL Delta: max_{t} Delta^{t}
         max_step_kl_div = stepwise_kl_div.max() # scalar
@@ -171,6 +186,8 @@ class LitRecurrentModel(pl.LightningModule):
 
         x, y = batch
 
+        intermediate_states = None
+
         # algorithm:
         # n_nograd_iters ~ {0, ..., train_max_n_iters - 1}
         # n_train_iters ~ {1, ..., train_max_n_iters - n_nograd_iters}
@@ -183,19 +200,15 @@ class LitRecurrentModel(pl.LightningModule):
         if self.train_config.incremental_training and n_nograd_iters > 0:
             orig_input = x
             with torch.no_grad(), self.ctx_manager:
-                x = self.model.forward_skip_output(x, n_iters=n_nograd_iters)
+                x, intermediate_states = self.model.forward_skip_decode(x, n_iters=n_nograd_iters, return_intermediate_states=False)
 
             with self.ctx_manager:
-                logits = self.model.forward_skip_embed(x, orig_input, n_iters=n_iters)
+                logits, intermediate_states = self.model.forward_skip_encode(x, orig_input, n_iters=n_iters, return_intermediate_states=self.need_delta_state_reg)
 
         # run model with tracking gradients for random number n_iters of iters
         else:
-            if self.need_delta_state_reg:
-                with self.ctx_manager:
-                    logits, intermediate_states = self.model(x, n_iters=n_iters, return_intermediate_states=True)
-            else:
-                with self.ctx_manager:
-                    logits = self.model(x, n_iters=n_iters)
+            with self.ctx_manager:
+                logits, intermediate_states = self.model(x, n_iters=n_iters, return_intermediate_states=self.need_delta_state_reg)
 
         loss = self.compute_loss(logits, y, intermediate_states, log_prefix='train')
 
@@ -249,6 +262,11 @@ class LitRecurrentModel(pl.LightningModule):
         logits, intermediate_states = self.model(x, n_iters=self.train_config.test_max_n_iters, return_intermediate_states=True)
         # intermediate_states: Dict[str, List[torch.Tensor]] with keys: disc_interm_states, logits_states, emb_norms. List length = n_iters
 
+        if self.need_delta_state_reg:
+            delta_kl_divs = self.calc_stepwise_kl_div(intermediate_states) # shape: (T - 1, B, X, Y)
+            stepwise_delta_kl = delta_kl_divs.sum(dim=(2,3)).mean(dim=1) # shape: (T - 1,)
+
+
         # compute and log loss
         loss = self.compute_loss(logits, y, intermediate_states, log_prefix='test')
 
@@ -270,6 +288,7 @@ class LitRecurrentModel(pl.LightningModule):
             # average embedding norm over batch, sequence length
             metrics['emb_norms'] = intermediate_states['emb_norms'][n_iters - 1].mean()
             metrics['delta_norms'] = intermediate_states['delta_norms'][n_iters - 1].mean()
+            metrics['normalized_delta_norms'] = metrics['delta_norms'] / metrics['emb_norms']
             if self.model_config.model_type == 'RecurrentSystem2Transformer':
                 metrics['compute_token_scores_entropy'] = intermediate_states['compute_token_scores_entropy'][n_iters - 1].mean()
                 metrics['candidate_norms'] = intermediate_states['candidate_norms'][n_iters - 1].mean()
@@ -278,6 +297,8 @@ class LitRecurrentModel(pl.LightningModule):
             if self.model.discrete_intermediate and not last_iter:
                 # average entropy of discrete state logits over batch, sequence length
                 metrics['disc_logits_softmax_entropy'] = intermediate_states['disc_logits_softmax_entropy'][n_iters - 1].mean()
+            if self.need_delta_state_reg and n_iters - 1 < len(stepwise_delta_kl):
+                metrics['step_delta_kl_div'] = stepwise_delta_kl[n_iters - 1]
 
             self.test_step_outputs.append(dict(test_split=test_split_name, n_iters=n_iters, metrics=metrics))
 
@@ -435,6 +456,12 @@ class LitRecurrentModel(pl.LightningModule):
         fig.show()
         wandb.log({'test/delta_norms': wandb.Plotly(fig)})
 
+        # n_iters vs normalized_delta_norms, color = test_split
+        fig = px.line(test_df, x='n_iters', y='normalized_delta_norms', color='test_split', title='Normalized Delta Norms', labels={'normalized_delta_norms': 'Normalized Delta Norms', 'n_iters': 'n_iters'})
+        fig.add_vline(x=self.train_config.train_max_n_iters, line_dash='dash', line_color='black', annotation_text='train_max_n_iters', annotation_position='top right')
+        fig.show()
+        wandb.log({'test/normalized_delta_norms': wandb.Plotly(fig)})
+
         # n_iters vs avg_emb_norms, color = test_split
         fig = px.line(test_df, x='n_iters', y='emb_norms', color='test_split', title='Average Embedding Norms', labels={'avg_emb_norms': 'Average Embedding Norms', 'n_iters': 'n_iters'})
         fig.add_vline(x=self.train_config.train_max_n_iters, line_dash='dash', line_color='black', annotation_text='train_max_n_iters', annotation_position='top right')
@@ -472,6 +499,13 @@ class LitRecurrentModel(pl.LightningModule):
             fig.add_vline(x=self.train_config.train_max_n_iters, line_dash='dash', line_color='black', annotation_text='train_max_n_iters', annotation_position='top right')
             fig.show()
             wandb.log({'test/normalized_token_update_norms': wandb.Plotly(fig)})
+
+        if self.need_delta_state_reg:
+            # n_iters vs step_delta_kl_div, color = test_split
+            fig = px.line(test_df, x='n_iters', y='step_delta_kl_div', color='test_split', title='Stepwise Delta KL Divergence', labels={'step_delta_kl_div': 'Stepwise Delta KL Divergence', 'n_iters': 'n_iters'})
+            fig.add_vline(x=self.train_config.train_max_n_iters, line_dash='dash', line_color='black', annotation_text='train_max_n_iters', annotation_position='top right')
+            fig.show()
+            wandb.log({'test/step_delta_kl_div': wandb.Plotly(fig)})
 
 from datetime import datetime
 def get_experiment_name(model_config, data_config, train_config):
